@@ -342,7 +342,6 @@ Rule format: Within a specified time window, requests to multicast address A are
 1. **PPPoE 不添加默认路由**：pppd 配置 `nodefaultroute`，从源头避免影响系统路由表
 2. **路由守卫双重保障**：每 5 秒检查一次，确保默认路由始终走内网口
 3. **PPPoE 仅用于 IPTV 认证**：拨号后 ppp 接口不承担任何系统流量
-4. **rp_filter 需要在宿主机设置**：由于容器内 /proc/sys 只读，需要在宿主机上将 IPTV 口的 rp_filter 设为 2（好像不用设置，我忘记了。）
 5. **按需拨号（可选）**：无活跃流时自动断开，有请求时自动拨号
 
 ## Routing Strategy
@@ -352,7 +351,6 @@ Design principles for routing in this program:
 1. **PPPoE does not add a default route**: pppd is configured with `nodefaultroute`, preventing it from affecting the system routing table at the source.
 2. **Dual route guard protection**: Checks every 5 seconds to ensure the default route always goes through the LAN port.
 3. **PPPoE is only for IPTV authentication**: After dialing, the ppp interface carries no system traffic.
-4. **rp_filter must be set on the host**: Since `/proc/sys` is read-only inside the container, you need to set the IPTV port's rp_filter to 2 (maybe or not) on the host machine.
 5. **On-demand dial-up (optional)**: Auto-disconnects when no streams are active; auto-dials when a request arrives.
 
 ## 故障排查
