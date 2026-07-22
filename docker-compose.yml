@@ -1,0 +1,36 @@
+services:
+  iptv-proxy:
+    build: .
+    image: iptv-udpproxy:latest
+    container_name: iptv-proxy
+    restart: unless-stopped
+
+    # ---- 网络配置 ----
+    # 使用 host 网络模式，以便直接访问物理网口进行组播监听和 PPPoE 拨号。
+    network_mode: host
+
+    # ---- 权限 ----
+    cap_add:
+      - NET_ADMIN     # pppd / 路由管理 / 组播加入
+      - NET_RAW       # 原始套接字
+    devices:
+      - /dev/net/tun:/dev/net/tun  # PPPoE 需要 tun 设备
+      - /dev/ppp:/dev/ppp
+
+    # ---- 环境变量 ----
+    environment:
+      # HTTP 监听地址
+      - LISTEN=0.0.0.0:18888
+      # 数据目录
+      - DATA_DIR=/data
+
+    # ---- 持久化 ----
+    volumes:
+      - iptv-data:/data
+
+    # 注意：rp_filter 需要在宿主机上设置，容器内无法修改
+    # 请参考 README 中的说明在宿主机上配置
+
+volumes:
+  iptv-data:
+    driver: local
