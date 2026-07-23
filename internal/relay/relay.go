@@ -249,6 +249,24 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// 初始规则解析
 	currentRealAddr := m.rules.Resolve(multicastAddr, time.Now())
+	rulesResolvedAddr := currentRealAddr // 记录规则解析结果，用于判断是否命中规则换源
+
+	// 连接建立时立即检查时长限制，在创建 reader 前确定最终目标地址
+	// 仅当规则解析未改变地址时才检查时长限制，避免与规则换源同时生效
+	var limitOverrideAddr string // 因时长限制切换到的备选地址，非空时跳过规则检查回切
+	if m.limits != nil && currentRealAddr == multicastAddr {
+		if result := m.limits.CheckLimit(multicastAddr, m.stats, 0, time.Now()); result != nil {
+			if replacement, ok := m.limits.PickReplacement(currentRealAddr); ok {
+				log.Printf("[relay] 频道 %s 已达到%s限制 (%d/%d秒)，直接使用备选源 %s",
+					multicastAddr, result.LimitType, result.CurrentSec, result.MaxSec, replacement)
+				currentRealAddr = replacement
+				limitOverrideAddr = replacement
+			} else {
+				log.Printf("[relay] 频道 %s 已达到%s限制，但备选地址池为空，使用原源", multicastAddr, result.LimitType)
+			}
+		}
+	}
+
 	realGroup, realPort := splitAddr(currentRealAddr)
 
 	log.Printf("[relay] %s 请求 %s → 实际 %s", r.RemoteAddr, multicastAddr, currentRealAddr)
@@ -348,6 +366,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var pendingGroup string
 	var pendingPort int
 	var switchTimeout *time.Timer // 切换超时计时器
+	var limitSwitchPending bool   // 有待完成的限制触发切换
 
 	// 切换超时时间：5秒内没有检测到关键帧则取消切换
 	const switchTimeoutDuration = 5 * time.Second
@@ -471,6 +490,11 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 				m.mu.Unlock()
 				log.Printf("[relay] 无缝换源完成: %s → %s", multicastAddr, currentRealAddr)
+				// 如果是限制触发的切换，记录覆盖地址以阻止规则检查回切
+				if limitSwitchPending {
+					limitOverrideAddr = currentRealAddr
+					limitSwitchPending = false
+				}
 			}
 
 		case subErrValue := <-subErr:
@@ -511,9 +535,15 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			newRealAddr := m.rules.Resolve(multicastAddr, time.Now())
 			if pendingRealAddr != "" && newRealAddr != pendingRealAddr {
 				cancelPendingSwitch()
+				limitSwitchPending = false
 			}
-			if newRealAddr != currentRealAddr && pendingRealAddr == "" {
-				// 检测到新的换源需求，且当前没有待处理的切换
+			// 如果限制规则被移除或禁用，清除限制覆盖状态
+			if limitOverrideAddr != "" && m.limits != nil && !m.limits.HasLimit(multicastAddr) {
+				log.Printf("[relay] 频道 %s 限制规则已移除，恢复正常规则检查", multicastAddr)
+				limitOverrideAddr = ""
+			}
+			if newRealAddr != currentRealAddr && pendingRealAddr == "" && limitOverrideAddr == "" {
+				// 检测到新的换源需求，且当前没有待处理的切换，且不在限制覆盖状态
 				log.Printf("[relay] 检测到换源规则: %s: %s → %s，开始预连接新源", multicastAddr, currentRealAddr, newRealAddr)
 
 				// 获取新源的 reader
@@ -547,8 +577,8 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				log.Printf("[relay] 新源 %s 已订阅，等待关键帧...", newRealAddr)
 			}
 
-			// 检查观看时长限制（仅在没有规则换源进行中时检查）
-			if m.limits != nil && pendingRealAddr == "" {
+			// 检查观看时长限制（仅在没有规则换源进行中、未处于限制覆盖状态、且规则未匹配时检查）
+			if m.limits != nil && pendingRealAddr == "" && limitOverrideAddr == "" && rulesResolvedAddr == multicastAddr {
 				liveElapsed := time.Since(info.StartTime)
 				if result := m.limits.CheckLimit(multicastAddr, m.stats, liveElapsed, time.Now()); result != nil {
 					replacement, ok := m.limits.PickReplacement(currentRealAddr)
@@ -572,6 +602,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 							pendingRealAddr = replacement
 							pendingGroup = limGroup
 							pendingPort = limPort
+							limitSwitchPending = true
 
 							streamSwitcher.StartWaiting()
 							switchTimeout = time.NewTimer(switchTimeoutDuration)

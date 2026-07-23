@@ -22,7 +22,7 @@ import (
 	"iptv-udpproxy/internal/stats"
 )
 
-var version = "1.0"
+var version = "1.1"
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmsgprefix)

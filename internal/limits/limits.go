@@ -153,6 +153,18 @@ func (s *Store) SetPool(pool PoolConfig) error {
 	return s.save()
 }
 
+// HasLimit 检查指定频道是否有启用的限制规则。
+func (s *Store) HasLimit(address string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i := range s.limits {
+		if s.limits[i].Enabled && s.limits[i].Address == address {
+			return true
+		}
+	}
+	return false
+}
+
 // CheckLimit 检查指定频道是否超限。
 // liveElapsed 为当前流的实时时长（time.Since），stats 提供历史数据。
 func (s *Store) CheckLimit(address string, statStore *stats.Store, liveElapsed time.Duration, now time.Time) *ExceedResult {
