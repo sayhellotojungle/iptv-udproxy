@@ -43,8 +43,10 @@ type PPPoEManager interface {
 	NotifyActivity()
 	NotifyIdle(idleTimeout time.Duration)
 	IsUp() bool
+	IsEnabled() bool
 	Start() error
 	SetOnDemand(enable bool)
+	SetEnabled(enable bool)
 }
 
 // ChannelStore 频道存储接口。
@@ -239,8 +241,8 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	multicastAddr := fmt.Sprintf("%s:%d", group, port)
 
-	// 按需拨号：如果 PPPoE 未启动，先启动拨号
-	if m.pppoe != nil && !m.pppoe.IsUp() {
+	// 按需拨号：如果 PPPoE 启用且未启动，先启动拨号
+	if m.pppoe != nil && m.pppoe.IsEnabled() && !m.pppoe.IsUp() {
 		log.Printf("[relay] PPPoE 未启动，尝试自动拨号...")
 		if err := m.pppoe.Start(); err != nil {
 			log.Printf("[relay] 自动拨号失败: %v", err)

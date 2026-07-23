@@ -22,7 +22,7 @@ import (
 	"iptv-udpproxy/internal/stats"
 )
 
-var version = "1.1"
+var version = "1.2"
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmsgprefix)
@@ -82,6 +82,7 @@ func main() {
 		Unit:  appSettings.PPPoEUnit,
 	}
 	pppoeMgr := pppoe.New(pppoeCfg, cfg.DataDir)
+	pppoeMgr.SetEnabled(appSettings.PPPoEEnable)
 	pppoeMgr.SetOnDemand(appSettings.OnDemand)
 
 	// 路由守卫（始终创建，配置可动态更新）
@@ -90,6 +91,7 @@ func main() {
 		mcastIface = "enp2s0-ovs"
 	}
 	guard := routeguard.New(mcastIface, pppoeMgr.IfaceName(), true)
+	guard.SetBlockPPPoE(appSettings.PPPoEEnable)
 
 	// 如果配置了 PPPoE 且不是按需拨号，先执行拨号
 	if appSettings.PPPoEEnable && !appSettings.OnDemand {
@@ -126,6 +128,7 @@ func main() {
 			Pass:  newSettings.PPPoEPass,
 			Unit:  newSettings.PPPoEUnit,
 		})
+		pppoeMgr.SetEnabled(newSettings.PPPoEEnable)
 		pppoeMgr.SetOnDemand(newSettings.OnDemand)
 		relayMgr.SetIdleTimeout(time.Duration(newSettings.IdleTimeout) * time.Second)
 
@@ -134,6 +137,7 @@ func main() {
 			mcastIface = "enp2s0-ovs"
 		}
 		guard.UpdateConfig(mcastIface, pppoeMgr.IfaceName(), true)
+		guard.SetBlockPPPoE(newSettings.PPPoEEnable)
 		guard.RunOnce()
 
 		log.Printf("[main] 运行时配置已更新")

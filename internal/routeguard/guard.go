@@ -20,6 +20,7 @@ type Guard struct {
 	mcastIface  string // IPTV 组播口
 	pppIface    string // ppp 接口名
 	rpFilterFix bool   // 是否修正 rp_filter
+	blockPPPoE  bool   // 是否阻止 ppp 接口入站流量
 	done        chan struct{}
 }
 
@@ -43,6 +44,14 @@ func (g *Guard) UpdateConfig(mcastIface, pppIface string, rpFilterFix bool) {
 	log.Printf("[guard] 配置已更新: mcast=%s, ppp=%s, rpFilterFix=%v", mcastIface, pppIface, rpFilterFix)
 }
 
+// SetBlockPPPoE 设置是否阻止 ppp 接口入站流量。
+func (g *Guard) SetBlockPPPoE(block bool) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.blockPPPoE = block
+	log.Printf("[guard] ppp 接口入站阻止: %v", block)
+}
+
 // Start 启动周期性路由检查。
 func (g *Guard) Start(interval time.Duration) {
 	go g.loop(interval)
@@ -60,11 +69,15 @@ func (g *Guard) RunOnce() {
 	mcastIface := g.mcastIface
 	pppIface := g.pppIface
 	rpFilterFix := g.rpFilterFix
+	blockPPPoE := g.blockPPPoE
 	g.mu.RUnlock()
 
 	g.fixDefaultRoute(pppIface)
 	if rpFilterFix {
 		g.fixRPFilter(mcastIface)
+	}
+	if blockPPPoE && pppIface != "" {
+		g.blockPPPoEInput(pppIface)
 	}
 }
 
@@ -125,6 +138,21 @@ func (g *Guard) fixRPFilter(mcastIface string) {
 			"net.ipv4.conf."+mcastIface+".rp_filter=2").Run(); err != nil {
 			log.Printf("[guard] 设置 rp_filter 失败: %v (需要在宿主机上设置)", err)
 		}
+	}
+}
+
+// blockPPPoEInput 在 ppp 接口上添加 iptables 规则阻止所有入站流量。
+func (g *Guard) blockPPPoEInput(pppIface string) {
+	// 检查是否已有规则（避免重复添加）
+	checkCmd := exec.Command("iptables", "-C", "INPUT", "-i", pppIface, "-j", "DROP")
+	if checkCmd.Run() == nil {
+		return // 规则已存在
+	}
+
+	// 添加规则阻止 ppp 接口的所有入站流量
+	log.Printf("[guard] 添加 iptables 规则阻止 %s 接口入站流量", pppIface)
+	if err := exec.Command("iptables", "-A", "INPUT", "-i", pppIface, "-j", "DROP").Run(); err != nil {
+		log.Printf("[guard] 添加 iptables 规则失败: %v (需要容器有 NET_ADMIN 权限)", err)
 	}
 }
 

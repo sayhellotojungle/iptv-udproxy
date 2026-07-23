@@ -54,6 +54,7 @@ type Manager struct {
 	stopCh     chan struct{} // 用于通知 waitLoop 退出
 	stopped    bool         // 标记是否主动停止
 	onDemand   bool         // 按需拨号模式
+	enabled    bool         // PPPoE 是否启用
 	idleTimer  *time.Timer  // 空闲断开定时器
 	waitWg     sync.WaitGroup // 跟踪 waitLoop goroutine
 	generation uint64       // 每次 Start 递增，防止旧 waitLoop 覆盖状态
@@ -71,6 +72,7 @@ func New(cfg Config, dataDir string) *Manager {
 		dataDir:        dataDir,
 		status:         Status{State: StateIdle, Unit: cfg.Unit},
 		stopCh:         make(chan struct{}),
+		enabled:        true, // 默认启用，由调用方根据设置决定
 		autoReconnect:  true,
 		reconnectDelay: 5 * time.Second,
 		reconnectMax:   2 * time.Minute,
@@ -206,6 +208,20 @@ func (m *Manager) SetOnDemand(enable bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.onDemand = enable
+}
+
+// SetEnabled 设置是否启用 PPPoE。
+func (m *Manager) SetEnabled(enable bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.enabled = enable
+}
+
+// IsEnabled 返回 PPPoE 是否启用。
+func (m *Manager) IsEnabled() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.enabled
 }
 
 // SetAutoReconnect 设置是否启用自动重连。
