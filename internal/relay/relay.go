@@ -23,6 +23,13 @@ import (
 	"iptv-udpproxy/internal/stats"
 )
 
+// SetIface 动态更新组播监听网口（Web 设置变更时同步，避免新 reader 使用旧接口）。
+func (m *Manager) SetIface(name string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ifaceName = name
+}
+
 // StreamInfo 当前活跃流信息。
 type StreamInfo struct {
 	ID          string    `json:"id"`
