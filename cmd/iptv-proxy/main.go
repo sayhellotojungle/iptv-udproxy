@@ -136,6 +136,7 @@ func main() {
 		if mcastIface == "" {
 			mcastIface = "enp2s0-ovs"
 		}
+		relayMgr.SetIface(mcastIface)
 		guard.UpdateConfig(mcastIface, pppoeMgr.IfaceName(), true)
 		guard.SetBlockPPPoE(newSettings.PPPoEEnable)
 		guard.RunOnce()
