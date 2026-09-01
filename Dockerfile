@@ -1,6 +1,8 @@
 FROM ubuntu:22.04
 
-ENV TZ=Asia/Shanghai
+# 时区可构建期指定：docker build --build-arg TZ=UTC
+ARG TZ=Asia/Shanghai
+ENV TZ=$TZ
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
 RUN apt-get update && \

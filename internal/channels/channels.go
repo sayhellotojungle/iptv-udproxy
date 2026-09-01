@@ -3,13 +3,22 @@ package channels
 
 import (
 	"bufio"
-	"encoding/json"
 	"fmt"
-	"os"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+
+	"iptv-udpproxy/internal/storeutil"
+)
+
+// m3uReAddr 从 /rtp/<addr:port> 或 /udp/<addr:port> 中提取组播地址。
+var m3uReAddr = regexp.MustCompile(`(?:rtp|udp)/(\d+\.\d+\.\d+\.\d+:\d+)`)
+
+var (
+	reTVGName = regexp.MustCompile(`tvg-name="([^"]*)"`)
+	reTVGroup = regexp.MustCompile(`group-title="([^"]*)"`)
+	reTVLogo  = regexp.MustCompile(`tvg-logo="([^"]*)"`)
 )
 
 // Channel 频道信息。
@@ -29,21 +38,14 @@ type Store struct {
 	counter  int64
 }
 
-// Open 打开或创建频道存储。
+// Open 打开或创建频道存储。文件损坏时备份后以空列表起步，不报错。
 func Open(path string) (*Store, error) {
 	s := &Store{
 		channels: make(map[string]*Channel),
 		path:     path,
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return s, nil
-		}
-		return nil, err
-	}
 	var list []Channel
-	if err := json.Unmarshal(data, &list); err != nil {
+	if _, err := storeutil.LoadJSON(path, &list); err != nil {
 		return nil, err
 	}
 	for i := range list {
@@ -81,11 +83,15 @@ func (s *Store) List() []Channel {
 	return out
 }
 
-// Get 根据地址获取频道。
-func (s *Store) Get(address string) *Channel {
+// Get 根据地址获取频道的值拷贝（不存在时 ok=false）。
+func (s *Store) Get(address string) (Channel, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.channels[address]
+	ch, ok := s.channels[address]
+	if !ok {
+		return Channel{}, false
+	}
+	return *ch, true
 }
 
 // GetName 根据地址获取频道名称，无名称返回空字符串。
@@ -161,45 +167,56 @@ func (s *Store) Delete(id string) error {
 	return fmt.Errorf("频道 %s 不存在", id)
 }
 
-// ImportM3U 导入 m3u 文件内容，返回导入数量。
+// ImportM3U 导入 m3u 文件内容，返回新增频道数量（已存在的地址不覆盖）。
+// 解析在锁外进行，大文件导出不阻塞 GetName 等读路径。
 func (s *Store) ImportM3U(content string) int {
+	parsed := parseM3U(content)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	count := 0
+	for i := range parsed {
+		if _, exists := s.channels[parsed[i].Address]; exists {
+			continue
+		}
+		s.counter++
+		ch := parsed[i]
+		ch.ID = fmt.Sprintf("c%d", s.counter)
+		s.channels[ch.Address] = &ch
+		count++
+	}
+	if count > 0 {
+		s.save()
+	}
+	return count
+}
+
+// parseM3U 纯函数：解析 m3u 内容为频道列表（不修改存储、不持锁）。
+func parseM3U(content string) []Channel {
+	var out []Channel
+	var curName, curGroup, curLogo string
+
 	scanner := bufio.NewScanner(strings.NewReader(content))
-
-	var currentName string
-	var currentGroup string
-	var currentLogo string
-
-	reName := regexp.MustCompile(`tvg-name="([^"]*)"`)
-	reGroup := regexp.MustCompile(`group-title="([^"]*)"`)
-	reLogo := regexp.MustCompile(`tvg-logo="([^"]*)"`)
+	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024) // 容忍超长行（如 base64 logo）
 
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 
 		if strings.HasPrefix(line, "#EXTINF:") {
-			// 解析频道信息
-			currentName = ""
-			currentGroup = ""
-			currentLogo = ""
-
-			if m := reName.FindStringSubmatch(line); m != nil {
-				currentName = m[1]
+			curName, curGroup, curLogo = "", "", ""
+			if m := reTVGName.FindStringSubmatch(line); m != nil {
+				curName = m[1]
 			}
-			if m := reGroup.FindStringSubmatch(line); m != nil {
-				currentGroup = m[1]
+			if m := reTVGroup.FindStringSubmatch(line); m != nil {
+				curGroup = m[1]
 			}
-			if m := reLogo.FindStringSubmatch(line); m != nil {
-				currentLogo = m[1]
+			if m := reTVLogo.FindStringSubmatch(line); m != nil {
+				curLogo = m[1]
 			}
-
-			// 如果 tvg-name 为空，尝试从逗号后面提取
-			if currentName == "" {
+			// tvg-name 为空时，从最后一个逗号后提取显示名
+			if curName == "" {
 				if idx := strings.LastIndex(line, ","); idx != -1 {
-					currentName = strings.TrimSpace(line[idx+1:])
+					curName = strings.TrimSpace(line[idx+1:])
 				}
 			}
 			continue
@@ -209,38 +226,26 @@ func (s *Store) ImportM3U(content string) int {
 			continue
 		}
 
-		// 这是 URL 行，提取组播地址
+		// URL 行：提取组播地址
 		address := extractMulticastAddr(line)
-		if address == "" || currentName == "" {
-			currentName = ""
+		if address == "" || curName == "" {
+			curName = ""
 			continue
 		}
-
-		// 添加或更新频道
-		if _, exists := s.channels[address]; !exists {
-			s.counter++
-			s.channels[address] = &Channel{
-				ID:      fmt.Sprintf("c%d", s.counter),
-				Name:    currentName,
-				Address: address,
-				Logo:    currentLogo,
-				Group:   currentGroup,
-			}
-			count++
-		}
-
-		currentName = ""
+		out = append(out, Channel{
+			Name:    curName,
+			Address: address,
+			Logo:    curLogo,
+			Group:   curGroup,
+		})
+		curName = ""
 	}
-
-	s.save()
-	return count
+	return out
 }
 
-// extractMulticastAddr 从 URL 中提取组播地址。
+// extractMulticastAddr 从 URL 中提取组播地址（支持 /rtp/ 与 /udp/ 前缀）。
 func extractMulticastAddr(url string) string {
-	// 格式: http://host:port/rtp/239.x.x.x:port
-	re := regexp.MustCompile(`/rtp/(\d+\.\d+\.\d+\.\d+:\d+)`)
-	if m := re.FindStringSubmatch(url); m != nil {
+	if m := m3uReAddr.FindStringSubmatch(url); m != nil {
 		return m[1]
 	}
 	return ""
@@ -292,19 +297,11 @@ func (s *Store) GenerateM3U(host string) string {
 	return sb.String()
 }
 
-// save 保存到文件（调用方需持有锁）。
+// save 原子保存到文件（调用方需持有锁）。
 func (s *Store) save() error {
 	list := make([]Channel, 0, len(s.channels))
 	for _, ch := range s.channels {
 		list = append(list, *ch)
 	}
-	data, err := json.MarshalIndent(list, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmpPath := s.path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, s.path)
+	return storeutil.WriteJSON(s.path, list, 0o644)
 }

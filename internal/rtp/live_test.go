@@ -44,12 +44,14 @@ func testOldRTPRelay(t *testing.T, url string) {
 		if _, err := io.ReadFull(resp.Body, datagram); err != nil {
 			t.Fatal(err)
 		}
-		payload, err := depacketizer.Depacketize(datagram)
+		payloads, err := depacketizer.Depacketize(datagram)
 		if err != nil {
 			t.Fatalf("datagram %d: %v", i, err)
 		}
-		if len(payload) != 7*tsPacketSize || payload[0] != 0x47 {
-			t.Fatalf("datagram %d produced malformed TS", i)
+		for _, payload := range payloads {
+			if len(payload) != 7*tsPacketSize || payload[0] != 0x47 {
+				t.Fatalf("datagram %d produced malformed TS", i)
+			}
 		}
 	}
 }

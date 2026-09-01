@@ -3,7 +3,6 @@ package config
 
 import (
 	"os"
-	"strconv"
 )
 
 // Config 为全局配置。
@@ -25,28 +24,4 @@ func envStr(key, def string) string {
 		return v
 	}
 	return def
-}
-
-func envBool(key string, def bool) bool {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	b, err := strconv.ParseBool(v)
-	if err != nil {
-		return def
-	}
-	return b
-}
-
-func envInt(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	n, err := strconv.Atoi(v)
-	if err != nil {
-		return def
-	}
-	return n
 }

@@ -8,7 +8,7 @@ A Go-based IPTV multicast-to-unicast service with integrated PPPoE dial-up and d
 
 ## 功能特性
 
-- **PPPoE 拨号**：在 IPTV 口上拨号，路由守卫确保系统默认路由始终走内网口。**注意：虽然iptv一般来说都是运营商内网，运营商也屏蔽了大多数的端口，但是从安全角度来说，这等于是一处开阔的入口，若不需要拨号就能看组播，就不要打开拨号，打开拨号要打开防火墙，代码最新内置了iptable命令，拒绝了所有从ppp interface来的流量。但，依然要多考虑或者在飞牛中打开防火墙。**
+- **PPPoE 拨号**：在 IPTV 口上拨号，路由守卫确保系统默认路由始终走内网口
 - **组播转单播**：监听 IPTV 口的组播流，通过 HTTP 提供单播访问
 - **动态换源**：按时间窗自动替换组播源地址（如 19:00-19:50 将 A 频道替换为 B 频道），客户端无感知。
 - **时长限制**：可根据日或者周时长进行限制，超出时长动态切换到其他源。
@@ -74,7 +74,8 @@ iptv_udproxy/
 │   ├── rtp/                 # RTP 协议处理
 │   ├── rules/               # 换源规则
 │   ├── settings/            # 设置管理
-│   └── stats/               # 统计信息
+│   ├── stats/               # 观看时长统计
+│   └── storeutil/           # JSON 持久化工具（原子写/损坏备份）
 ├── Dockerfile               # Docker 构建文件
 ├── docker-compose.yml       # Docker Compose 配置
 ├── entrypoint.sh            # 容器入口脚本
@@ -86,12 +87,14 @@ iptv_udproxy/
 ## 请求格式
 
 ```
-http://<飞牛内网IP>:18888/rtp/<组播IP>:<端口>
+http://<飞牛内网IP>:18888/rtp/<组播IP>:<端口>     # RTP 封装的组播流（自动剥离 RTP 头）
+http://<飞牛内网IP>:18888/udp/<组播IP>:<端口>     # 裸 MPEG-TS 组播流
 ```
 
 示例：
 ```
 http://192.168.1.1:18888/rtp/2.9.1.3:1376
+http://192.168.1.1:18888/udp/239.254.96.161:9040
 ```
 
 ## Request Format
@@ -193,15 +196,18 @@ docker logs -f iptv-proxy
 
 | 变量名 | 默认值 | 说明 |
 |--------|--------|------|
-| `LISTEN` | `0.0.0.0:18888` | HTTP 监听地址 |
-| `DATA_DIR` | `/data` | 数据目录（规则文件、拨号配置） |
+| `LISTEN` | `:18888` | HTTP 监听地址（`docker-compose.yml` 中设为 `0.0.0.0:18888`） |
+| `DATA_DIR` | `/data` | 数据目录（规则文件、时长统计等） |
 
 ### 数据持久化
 
-数据目录 `/data` 包含以下文件：
+数据目录 `/data` 包含以下文件（全部为原子写入；损坏时自动重命名为 `*.corrupt-<时间戳>` 备份并以空配置起步）：
 
 - `rules.json` - 换源规则配置
-- `settings.json` - 服务配置（PPPoE 账号、网口选择等）
+- `settings.json` - 服务配置（PPPoE 账号、网口选择等，权限 0600）
+- `channels.json` - 频道名称/分组/Logo 映射（m3u 导入）
+- `watchtime.json` - 观看时长统计（内存聚合 + 30 秒定时落盘，自动保留 90 天）
+- `limits.json` - 时长限制规则 + 全局备选地址池
 
 ### 网络要求
 
@@ -215,15 +221,18 @@ docker logs -f iptv-proxy
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LISTEN` | `0.0.0.0:18888` | HTTP listen address |
-| `DATA_DIR` | `/data` | Data directory (rule files, dial-up config) |
+| `LISTEN` | `:18888` | HTTP listen address (`docker-compose.yml` sets it to `0.0.0.0:18888`) |
+| `DATA_DIR` | `/data` | Data directory (rule files, watch-time stats, etc.) |
 
 ### Data Persistence
 
-The `/data` directory contains:
+The `/data` directory contains (all writes are atomic; a corrupt file is renamed to `*.corrupt-<timestamp>` and the service starts with empty data):
 
 - `rules.json` — Source-switching rule configuration.
-- `settings.json` — Service configuration (PPPoE credentials, interface selection, etc.).
+- `settings.json` — Service configuration (PPPoE credentials, interface selection, etc.; 0600 permissions).
+- `channels.json` — Channel name/group/logo mapping (m3u import).
+- `watchtime.json` — Watch-time statistics (in-memory aggregation, flushed every 30 s, retained 90 days).
+- `limits.json` — Duration-limit rules + global backup address pool.
 
 ### Network Requirements
 
@@ -267,33 +276,55 @@ The `/data` directory contains:
 
 | 方法 | 路径 | 说明 |
 |------|------|------|
-| GET | `/rtp/<group>:<port>` | 组播流转单播（主要功能）|
-| GET | `/api/status` | 服务状态 |
+| GET | `/rtp/<group>:<port>` | 组播流转单播，RTP 封装（主要功能）|
+| GET | `/udp/<group>:<port>` | 组播流转单播，裸 MPEG-TS |
+| GET | `/healthz` | 健康检查 |
+| GET | `/api/status` | 服务状态（含 `limit_blocked` 限制告警列表）|
 | GET | `/api/streams` | 活跃流列表 |
-| GET | `/api/rules` | 规则列表 |
-| POST | `/api/rules` | 新增规则 |
-| PUT | `/api/rules/<id>` | 更新规则 |
-| DELETE | `/api/rules/<id>` | 删除规则 |
+| GET/POST | `/api/rules` | 规则列表 / 新增规则 |
+| PUT/DELETE | `/api/rules/<id>` | 更新 / 删除规则 |
+| GET/POST | `/api/channels` | 频道列表 / 新增频道 |
+| PUT/DELETE | `/api/channels/<id>` | 更新 / 删除频道 |
+| POST | `/api/channels/import` | 导入 m3u（上传文件或 JSON `{"content": "..."}`）|
+| GET | `/api/m3u` | 导出频道列表为 m3u 文件 |
 | POST | `/api/pppoe/retry` | 重新拨号 |
-| GET | `/api/settings` | 获取配置 |
-| PUT | `/api/settings` | 更新配置 |
 | GET | `/api/interfaces` | 获取网口列表 |
+| GET | `/api/settings` | 获取配置（密码脱敏，不返回明文）|
+| PUT | `/api/settings` | 更新配置（密码留空/掩码 = 保持不变）|
+| GET | `/api/watchtime?period=day\|week\|month&date=YYYY-MM-DD&top=N` | 观看时长统计（默认今天，`top` 限制排名条数）|
+| DELETE | `/api/watchtime` | 清空观看时长统计 |
+| GET/POST | `/api/limits` | 时长限制规则列表 / 新增 |
+| PUT/DELETE | `/api/limits/<id>` | 更新 / 删除时长限制规则 |
+| GET/PUT | `/api/limits/pool` | 全局备选地址池（限制触发时的切换目标）|
+
+所有错误响应统一为 JSON：`{"error": "..."}`。
 
 ## API Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/rtp/<group>:<port>` | Multicast to unicast (main function) |
-| GET | `/api/status` | Service status |
+| GET | `/rtp/<group>:<port>` | Multicast to unicast, RTP encapsulated (main function) |
+| GET | `/udp/<group>:<port>` | Multicast to unicast, raw MPEG-TS |
+| GET | `/healthz` | Health check |
+| GET | `/api/status` | Service status (includes `limit_blocked` alert list) |
 | GET | `/api/streams` | Active stream list |
-| GET | `/api/rules` | Rule list |
-| POST | `/api/rules` | Add rule |
-| PUT | `/api/rules/<id>` | Update rule |
-| DELETE | `/api/rules/<id>` | Delete rule |
+| GET/POST | `/api/rules` | Rule list / add rule |
+| PUT/DELETE | `/api/rules/<id>` | Update / delete rule |
+| GET/POST | `/api/channels` | Channel list / add channel |
+| PUT/DELETE | `/api/channels/<id>` | Update / delete channel |
+| POST | `/api/channels/import` | Import m3u (file upload or JSON `{"content": "..."}`) |
+| GET | `/api/m3u` | Export channels as an m3u file |
 | POST | `/api/pppoe/retry` | Re-dial PPPoE |
-| GET | `/api/settings` | Get configuration |
-| PUT | `/api/settings` | Update configuration |
 | GET | `/api/interfaces` | List network interfaces |
+| GET | `/api/settings` | Get configuration (password is masked, never returned in plaintext) |
+| PUT | `/api/settings` | Update configuration (empty/masked password = keep current) |
+| GET | `/api/watchtime?period=day\|week\|month&date=YYYY-MM-DD&top=N` | Watch-time statistics (defaults to today; `top` limits ranking rows) |
+| DELETE | `/api/watchtime` | Clear watch-time statistics |
+| GET/POST | `/api/limits` | Duration-limit rule list / add |
+| PUT/DELETE | `/api/limits/<id>` | Update / delete duration-limit rule |
+| GET/PUT | `/api/limits/pool` | Global backup address pool (switch target when a limit triggers) |
+
+All error responses are uniform JSON: `{"error": "..."}`.
 
 ## 动态换源规则
 
@@ -342,7 +373,10 @@ Rule format: Within a specified time window, requests to multicast address A are
 1. **PPPoE 不添加默认路由**：pppd 配置 `nodefaultroute`，从源头避免影响系统路由表
 2. **路由守卫双重保障**：每 5 秒检查一次，确保默认路由始终走内网口
 3. **PPPoE 仅用于 IPTV 认证**：拨号后 ppp 接口不承担任何系统流量
-5. **按需拨号（可选）**：无活跃流时自动断开，有请求时自动拨号
+4. **按需拨号（可选）**：无活跃流时自动断开，有请求时自动拨号
+
+> 说明：本服务**不需要** `net.ipv4.ip_forward`。组播包由内核投递给本进程（接收而非转发），
+> 出去的 HTTP 单播由本进程新建并走默认路由，全程不涉及 IP 转发，因此也不会改写宿主机全局 sysctl。
 
 ## Routing Strategy
 

@@ -15,10 +15,9 @@ import (
 	"golang.org/x/net/ipv4"
 )
 
-// Packet 一条组播数据。
+// Packet 一条组播数据（Data 为该包内容的拷贝，长度即包长）。
 type Packet struct {
 	Data []byte
-	N    int
 }
 
 // ErrSubscriberOverflow 表示订阅者处理速度不足，继续转发会造成 MPEG-TS 静默丢包。
@@ -37,6 +36,7 @@ type Reader struct {
 	ifi   *net.Interface
 
 	mu          sync.Mutex
+	stopOnce    sync.Once
 	subscribers map[chan<- Packet]*subscriber
 	conn        *net.UDPConn
 	done        chan struct{}
@@ -87,13 +87,10 @@ func (r *Reader) Start() error {
 	return nil
 }
 
-// Stop 停止读取并释放资源。
+// Stop 停止读取并释放资源。可被并发/重复调用（close 只发生一次，
+// UDPConn 重复 Close 安全），独立使用 Reader 时不会 double-close panic。
 func (r *Reader) Stop() {
-	select {
-	case <-r.done:
-	default:
-		close(r.done)
-	}
+	r.stopOnce.Do(func() { close(r.done) })
 	if r.conn != nil {
 		r.conn.Close()
 	}
@@ -151,16 +148,16 @@ func (r *Reader) readLoop() {
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
 
-		r.broadcast(pkt, n)
+		r.broadcast(pkt)
 	}
 }
 
-func (r *Reader) broadcast(data []byte, n int) {
+func (r *Reader) broadcast(data []byte) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for ch, s := range r.subscribers {
 		select {
-		case s.ch <- Packet{Data: data, N: n}:
+		case s.ch <- Packet{Data: data}:
 		default:
 			// 静默丢包会直接破坏视频，移除慢订阅并通知 handler 结束连接。
 			select {

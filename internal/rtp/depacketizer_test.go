@@ -40,7 +40,10 @@ func TestDepacketize(t *testing.T) {
 			if err != nil {
 				t.Fatalf("Depacketize() error = %v", err)
 			}
-			if string(got) != string(ts) {
+			if len(got) != 1 {
+				t.Fatalf("expected 1 emitted payload, got %d", len(got))
+			}
+			if string(got[0]) != string(ts) {
 				t.Fatal("MPEG-TS payload changed")
 			}
 		})
@@ -51,28 +54,96 @@ func TestDepacketizerSequenceTracking(t *testing.T) {
 	d := NewDepacketizer()
 	ts := makeTSPayload(1)
 
-	for _, seq := range []uint16{65535, 0} {
-		if _, err := d.Depacketize(makeRTPPacket(seq, 1, 0x80, nil, ts, 0)); err != nil {
-			t.Fatalf("sequence %d: %v", seq, err)
-		}
+	emit := func(seq uint16, ssrc uint32) ([][]byte, error) {
+		return d.Depacketize(makeRTPPacket(seq, ssrc, 0x80, nil, ts, 0))
 	}
-	// Sequence gap: packet accepted, gap counted.
-	if _, err := d.Depacketize(makeRTPPacket(2, 1, 0x80, nil, ts, 0)); err != nil {
-		t.Fatalf("sequence gap should not error: %v", err)
+
+	// 65535 → 0 回绕，正常输出
+	if out, err := emit(65535, 1); err != nil || len(out) != 1 {
+		t.Fatalf("seq 65535: out=%d err=%v", len(out), err)
 	}
-	if _, err := d.Depacketize(makeRTPPacket(2, 1, 0x80, nil, ts, 0)); !errors.Is(err, ErrDuplicate) {
+	if out, err := emit(0, 1); err != nil || len(out) != 1 {
+		t.Fatalf("seq 0: out=%d err=%v", len(out), err)
+	}
+
+	// 间隙：seq 2 先到，缓冲等待（不输出、不报错）
+	if out, err := emit(2, 1); err != nil || len(out) != 0 {
+		t.Fatalf("gapped seq 2 should be buffered: out=%d err=%v", len(out), err)
+	}
+	// 重复
+	if _, err := emit(2, 1); !errors.Is(err, ErrDuplicate) {
 		t.Fatalf("duplicate error = %v", err)
 	}
-	if _, err := d.Depacketize(makeRTPPacket(1, 1, 0x80, nil, ts, 0)); !errors.Is(err, ErrOutOfOrder) {
+	// 缺的 seq 1 到达：一次输出 [1, 2]
+	out, err := emit(1, 1)
+	if err != nil || len(out) != 2 {
+		t.Fatalf("reorder: out=%d err=%v", len(out), err)
+	}
+	// 现在 seq 1 已过，再来的 1 才是过时包
+	if _, err := emit(1, 1); !errors.Is(err, ErrOutOfOrder) {
 		t.Fatalf("out-of-order error = %v", err)
 	}
-	if _, err := d.Depacketize(makeRTPPacket(100, 2, 0x80, nil, ts, 0)); err != nil {
-		t.Fatalf("SSRC change: %v", err)
+	// SSRC 变化：状态重置，新流首包正常输出
+	if out, err := emit(100, 2); err != nil || len(out) != 1 {
+		t.Fatalf("SSRC change: out=%d err=%v", len(out), err)
 	}
 
 	stats := d.Stats()
-	if stats.Packets != 4 || stats.SequenceGaps != 1 || stats.Duplicates != 1 || stats.OutOfOrder != 1 || stats.SSRCChanges != 1 {
+	if stats.Packets != 5 || stats.SequenceGaps != 0 || stats.Duplicates != 1 || stats.OutOfOrder != 1 || stats.SSRCChanges != 1 {
 		t.Fatalf("unexpected stats: %+v", stats)
+	}
+}
+
+func TestDepacketizerBufferOverflowDropsOldest(t *testing.T) {
+	d := NewDepacketizer()
+	ts := makeTSPayload(1)
+
+	// seq 0 输出；seq 2..17 先到（16 个，超过 reorderLimit）
+	if out, err := d.Depacketize(makeRTPPacket(0, 1, 0x80, nil, ts, 0)); err != nil || len(out) != 1 {
+		t.Fatalf("seq 0: out=%d err=%v", len(out), err)
+	}
+	for seq := uint16(2); seq < 18; seq++ {
+		if _, err := d.Depacketize(makeRTPPacket(seq, 1, 0x80, nil, ts, 0)); err != nil {
+			t.Fatalf("seq %d: %v", seq, err)
+		}
+	}
+	// 溢出后最旧的 2..(2..8 中部分) 被丢弃；seq 1 到达后能输出后续一段
+	out, err := d.Depacketize(makeRTPPacket(1, 1, 0x80, nil, ts, 0))
+	if err != nil || len(out) == 0 {
+		t.Fatalf("seq 1: out=%d err=%v", len(out), err)
+	}
+	stats := d.Stats()
+	if stats.SequenceGaps == 0 {
+		t.Fatalf("expected dropped gaps, stats: %+v", stats)
+	}
+}
+
+func TestDepacketizerSteadyStateJitter(t *testing.T) {
+	// 固定抖动窗（成对 (2,1),(4,3)... 每对晚一步到达）不应产生丢包：
+	// 0..39 全部且只按序输出一次。
+	d := NewDepacketizer()
+	ts := makeTSPayload(1)
+
+	delivered := 0
+	emit := func(seq uint16) {
+		out, err := d.Depacketize(makeRTPPacket(seq, 1, 0x80, nil, ts, 0))
+		if err != nil {
+			t.Fatalf("seq %d: %v", seq, err)
+		}
+		delivered += len(out)
+	}
+
+	emit(0)
+	for seq := uint16(1); seq < 39; seq += 2 {
+		emit(seq + 1)
+		emit(seq)
+	}
+	emit(39)
+	if delivered != 40 {
+		t.Fatalf("steady-state jitter lost packets: delivered %d/40 (stats %+v)", delivered, d.Stats())
+	}
+	if d.Stats().SequenceGaps != 0 || d.Stats().OutOfOrder != 0 {
+		t.Fatalf("no loss expected, stats: %+v", d.Stats())
 	}
 }
 

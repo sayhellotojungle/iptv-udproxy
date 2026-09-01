@@ -246,12 +246,13 @@ func filledPacket() []byte {
 	return packet
 }
 
+// writePCRBase 按 MPEG-2 规范布局写入 PCR 字段（b3=base8..2+保留1，b4=base1..0+PCR_ext，b5=保留11111111）。
 func writePCRBase(field []byte, base uint64) {
 	base &= clockMask
 	field[0] = byte(base >> 25)
 	field[1] = byte(base >> 17)
 	field[2] = byte(base >> 9)
-	field[3] = byte(base >> 1)
-	field[4] = byte(base&1)<<7 | 0x7e
-	field[5] = 0
+	field[3] = byte((base>>2)&0x7f)<<1 | 1
+	field[4] = byte((base>>1)&0x03) << 6 // base 1..0 + PCR_ext=0
+	field[5] = 0xff
 }

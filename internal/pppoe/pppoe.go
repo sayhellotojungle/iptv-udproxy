@@ -50,19 +50,20 @@ type Manager struct {
 	mu         sync.Mutex
 	status     Status
 	cmd        *exec.Cmd
+	starting   bool // 启动中占位：防止并发 Start 同时拉起两个 pppd
 	startAt    time.Time
-	stopCh     chan struct{} // 用于通知 waitLoop 退出
-	stopped    bool         // 标记是否主动停止
-	onDemand   bool         // 按需拨号模式
-	enabled    bool         // PPPoE 是否启用
-	idleTimer  *time.Timer  // 空闲断开定时器
+	stopCh     chan struct{}  // 用于通知 waitLoop 退出
+	stopped    bool           // 标记是否主动停止
+	onDemand   bool           // 按需拨号模式
+	enabled    bool           // PPPoE 是否启用
+	idleTimer  *time.Timer    // 空闲断开定时器
 	waitWg     sync.WaitGroup // 跟踪 waitLoop goroutine
-	generation uint64       // 每次 Start 递增，防止旧 waitLoop 覆盖状态
+	generation uint64         // 每次 Start 递增，防止旧 waitLoop 覆盖状态
 
 	autoReconnect   bool          // pppd 意外退出后自动重连
 	reconnectDelay  time.Duration // 重连初始延迟
 	reconnectMax    time.Duration // 重连最大延迟
-	reconnectCancel chan struct{}  // 取消重连
+	reconnectCancel chan struct{} // 取消重连
 }
 
 // New 创建 Manager，拨号未启动。
@@ -81,6 +82,8 @@ func New(cfg Config, dataDir string) *Manager {
 
 // IfaceName 返回拨号接口名。
 func (m *Manager) IfaceName() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return fmt.Sprintf("ppp%d", m.cfg.Unit)
 }
 
@@ -100,12 +103,15 @@ func (m *Manager) Status() Status {
 }
 
 // Start 启动拨号，阻塞直到 pppd 初始化完成（最多 15 秒）。
+// "启动中"占位在锁内完成，并发调用（手动重试 + 按需自动拨号 + 重连）
+// 只会拉起一个 pppd。
 func (m *Manager) Start() error {
 	m.mu.Lock()
-	if m.cmd != nil {
+	if m.cmd != nil || m.starting {
 		m.mu.Unlock()
-		return fmt.Errorf("拨号进程已在运行")
+		return fmt.Errorf("拨号进程已在运行或启动中")
 	}
+	m.starting = true
 	m.generation++
 	gen := m.generation
 	m.status = Status{State: StateConnecting, Unit: m.cfg.Unit}
@@ -116,17 +122,24 @@ func (m *Manager) Start() error {
 		close(m.reconnectCancel)
 		m.reconnectCancel = nil
 	}
+	cfg := m.cfg // 锁内取快照，之后写文件不再与 UpdateConfig 竞争
 	m.mu.Unlock()
 
+	fail := func(msg string) error {
+		m.mu.Lock()
+		m.starting = false
+		m.mu.Unlock()
+		m.setStateError(msg)
+		return fmt.Errorf("%s", msg)
+	}
+
 	// 写入 pap-secrets / chap-secrets
-	if err := m.writeSecrets(); err != nil {
-		m.setStateError("写入认证文件失败: " + err.Error())
-		return err
+	if err := m.writeSecrets(cfg); err != nil {
+		return fail("写入认证文件失败: " + err.Error())
 	}
 	// 写入拨号配置
-	if err := m.writeOptions(); err != nil {
-		m.setStateError("写入拨号配置失败: " + err.Error())
-		return err
+	if err := m.writeOptions(cfg); err != nil {
+		return fail("写入拨号配置失败: " + err.Error())
 	}
 
 	// 启动 pppd
@@ -135,14 +148,24 @@ func (m *Manager) Start() error {
 	setSysProcAttr(cmd.SysProcAttr)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	cmd.WaitDelay = 10 * time.Second // pppd 挂死不退时 10 秒后强制结束 Wait
 
 	if err := cmd.Start(); err != nil {
-		m.setStateError("启动 pppd 失败: " + err.Error())
-		return err
+		return fail("启动 pppd 失败: " + err.Error())
 	}
 
 	m.mu.Lock()
+	if m.stopped {
+		// Stop() 在启动窗口内被调用：不登记进程，直接杀掉
+		m.starting = false
+		m.mu.Unlock()
+		if cmd.Process != nil {
+			_ = killProcess(cmd.Process.Pid, syscall.SIGTERM)
+		}
+		return fmt.Errorf("拨号过程中被停止")
+	}
 	m.cmd = cmd
+	m.starting = false
 	m.startAt = time.Now()
 	m.mu.Unlock()
 
@@ -298,6 +321,11 @@ func (m *Manager) waitLoop(cmd *exec.Cmd, gen uint64) {
 		m.mu.Lock()
 		stopped := m.stopped
 		currentGen := m.generation
+		onDemand := m.onDemand
+		if gen == currentGen && m.cmd == cmd {
+			// 对应进程已退出，清空登记，允许重新 Start
+			m.cmd = nil
+		}
 		m.mu.Unlock()
 
 		if stopped {
@@ -306,6 +334,15 @@ func (m *Manager) waitLoop(cmd *exec.Cmd, gen uint64) {
 		}
 		if gen != currentGen {
 			// 旧的 waitLoop，不应覆盖新状态
+			return
+		}
+
+		if onDemand {
+			// 按需拨号：回 Idle 等下次流请求再拨，不卡 Error 状态
+			m.mu.Lock()
+			m.status = Status{State: StateIdle, Unit: m.cfg.Unit}
+			m.mu.Unlock()
+			log.Printf("[pppoe] pppd 已退出（按需模式），等待下次请求")
 			return
 		}
 
@@ -318,7 +355,7 @@ func (m *Manager) waitLoop(cmd *exec.Cmd, gen uint64) {
 
 		// 自动重连
 		m.mu.Lock()
-		shouldReconnect := m.autoReconnect && !m.onDemand
+		shouldReconnect := m.autoReconnect
 		m.mu.Unlock()
 		if shouldReconnect {
 			m.scheduleReconnect()
@@ -402,9 +439,18 @@ func (m *Manager) waitForIface(timeout time.Duration) error {
 	return fmt.Errorf("等待接口 %s 超时", iface)
 }
 
+// escapePPP 转义 pppd 配置引号串中的特殊字符（引号/反斜杠/换行）。
+func escapePPP(s string) string {
+	s = strings.ReplaceAll(s, "\\", "\\\\")
+	s = strings.ReplaceAll(s, "\"", "\\\"")
+	s = strings.ReplaceAll(s, "\n", "\\n")
+	return s
+}
+
 // writeSecrets 写入 /etc/ppp/pap-secrets 和 chap-secrets。
-func (m *Manager) writeSecrets() error {
-	line := fmt.Sprintf("\"%s\" * \"%s\" *\n", m.cfg.User, m.cfg.Pass)
+// cfg 必须是 Start 锁内取的快照，避免与 UpdateConfig 数据竞争。
+func (m *Manager) writeSecrets(cfg Config) error {
+	line := fmt.Sprintf("\"%s\" * \"%s\" *\n", escapePPP(cfg.User), escapePPP(cfg.Pass))
 	for _, f := range []string{"/etc/ppp/pap-secrets", "/etc/ppp/chap-secrets"} {
 		if err := os.WriteFile(f, []byte(line), 0o600); err != nil {
 			return fmt.Errorf("写入 %s 失败: %w", f, err)
@@ -414,16 +460,17 @@ func (m *Manager) writeSecrets() error {
 }
 
 // writeOptions 写入 pppd peer 配置文件。
-func (m *Manager) writeOptions() error {
+// cfg 必须是 Start 锁内取的快照，避免与 UpdateConfig 数据竞争。
+func (m *Manager) writeOptions(cfg Config) error {
 	peersDir := "/etc/ppp/peers"
 	_ = os.MkdirAll(peersDir, 0o700)
 
 	opts := []string{
-		"plugin pppoe.so " + m.cfg.Iface, // 绑定物理网口
+		"plugin pppoe.so " + cfg.Iface, // 绑定物理网口
 		"noauth",
-		"user " + m.cfg.User,
-		"password " + m.cfg.Pass,
-		fmt.Sprintf("unit %d", m.cfg.Unit),
+		"user \"" + escapePPP(cfg.User) + "\"",
+		"password \"" + escapePPP(cfg.Pass) + "\"",
+		fmt.Sprintf("unit %d", cfg.Unit),
 		"nodefaultroute", // 明确禁止 pppd 添加默认路由，避免影响系统网络
 		"noipdefault",
 		"usepeerdns",
@@ -435,8 +482,8 @@ func (m *Manager) writeOptions() error {
 		"mtu 1492",
 		"mru 1492",
 	}
-	if m.cfg.Extra != "" {
-		opts = append(opts, m.cfg.Extra)
+	if cfg.Extra != "" {
+		opts = append(opts, cfg.Extra)
 	}
 
 	content := strings.Join(opts, "\n") + "\n"

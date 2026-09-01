@@ -1,20 +1,30 @@
 // Package stats 记录每个频道的观看时长，支持按天/周/月查询和排名。
+//
+// 实现：内存聚合（地址 -> 日期 -> 秒）+ 30 秒定时落盘 + 90 天保留期裁剪，
+// 替换旧版"每次 Add 持锁全量重写"（记录只增、文件随观看时长线性膨胀）。
 package stats
 
 import (
+	"context"
 	"encoding/json"
-	"fmt"
-	"os"
+	"log"
 	"sort"
 	"sync"
 	"time"
+
+	"iptv-udpproxy/internal/storeutil"
 )
 
-// Record 一条观看记录（单次流会话结束时写入）。
+const (
+	flushInterval = 30 * time.Second // 定时落盘间隔
+	retentionDays = 90               // 历史数据保留天数
+)
+
+// Record 旧版单条观看记录（仅用于兼容加载旧文件）。
 type Record struct {
 	Address  string `json:"address"`
-	Date     string `json:"date"`      // "2026-07-21"
-	Duration int64  `json:"duration"`   // 秒
+	Date     string `json:"date"`     // "2026-07-21"
+	Duration int64  `json:"duration"` // 秒
 }
 
 // RankItem 频道排名项。
@@ -31,172 +41,218 @@ type PeriodResult struct {
 	Channels     []RankItem `json:"channels"`
 }
 
-// Store 观看时长存储，带 JSON 持久化。
+// Store 观看时长存储：内存聚合 + 定时落盘。
 type Store struct {
-	mu      sync.Mutex
-	path    string
-	records []Record
+	mu        sync.Mutex
+	path      string
+	aggr      map[string]map[string]int64 // address -> "2006-01-02" -> 秒
+	closeOnce sync.Once
 }
 
-// Open 加载或初始化观看时长存储。
-func Open(path string) (*Store, error) {
-	s := &Store{path: path}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return s, nil
+// fileData 磁盘格式（新聚合格式 + 旧记录数组兼容）。
+type fileData struct {
+	aggr map[string]map[string]int64
+}
+
+// UnmarshalJSON 兼容两种格式：
+//   - 新格式: {"addr": {"2026-07-21": 3600}}
+//   - 旧格式: [{"address":..., "date":..., "duration":...}, ...]（合并聚合后加载）
+func (f *fileData) UnmarshalJSON(data []byte) error {
+	var m map[string]map[string]int64
+	if err := json.Unmarshal(data, &m); err == nil {
+		f.aggr = m
+		return nil
+	}
+	var records []Record
+	if err := json.Unmarshal(data, &records); err != nil {
+		return err
+	}
+	m = make(map[string]map[string]int64)
+	for _, r := range records {
+		if r.Address == "" || r.Date == "" || r.Duration <= 0 {
+			continue
 		}
+		dm, ok := m[r.Address]
+		if !ok {
+			dm = make(map[string]int64)
+			m[r.Address] = dm
+		}
+		dm[r.Date] += r.Duration
+	}
+	f.aggr = m
+	return nil
+}
+
+// Open 加载或初始化观看时长存储。文件损坏时备份后以空统计起步，不报错。
+func Open(path string) (*Store, error) {
+	s := &Store{path: path, aggr: make(map[string]map[string]int64)}
+	var fd fileData
+	if _, err := storeutil.LoadJSON(path, &fd); err != nil {
 		return nil, err
 	}
-	if len(data) > 0 {
-		if err := json.Unmarshal(data, &s.records); err != nil {
-			return nil, fmt.Errorf("解析观看时长文件 %s 失败: %w", path, err)
+	for addr, byDate := range fd.aggr {
+		if len(byDate) == 0 {
+			continue
 		}
+		s.aggr[addr] = byDate
 	}
 	return s, nil
 }
 
-// Add 追加一条观看记录并持久化。
+// Start 启动后台定时落盘 goroutine，ctx 结束即退出。
+func (s *Store) Start(ctx context.Context) {
+	go func() {
+		ticker := time.NewTicker(flushInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := s.Flush(); err != nil {
+					log.Printf("[stats] 定时落盘失败: %v", err)
+				}
+			}
+		}
+	}()
+}
+
+// Close 幂等：末次落盘，确保退出不丢已聚合数据。
+func (s *Store) Close() {
+	s.closeOnce.Do(func() {
+		if err := s.Flush(); err != nil {
+			log.Printf("[stats] 末次落盘失败: %v", err)
+		}
+	})
+}
+
+// Add 聚合一次观看时长（按 t 所在日期）。不立即落盘。
 func (s *Store) Add(address string, duration time.Duration, t time.Time) {
-	if duration <= 0 {
+	sec := int64(duration.Seconds())
+	if sec <= 0 || address == "" {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.records = append(s.records, Record{
-		Address:  address,
-		Date:     t.Format("2006-01-02"),
-		Duration: int64(duration.Seconds()),
-	})
-	s.save()
+	byDate, ok := s.aggr[address]
+	if !ok {
+		byDate = make(map[string]int64)
+		s.aggr[address] = byDate
+	}
+	byDate[t.Format("2006-01-02")] += sec
+	s.mu.Unlock()
 }
 
-// SumByDate 返回某天每个频道的累计秒数。
-func (s *Store) SumByDate(date string) map[string]int64 {
+// Flush 立即落盘（并顺带裁剪过期数据）。
+func (s *Store) Flush() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make(map[string]int64)
-	for _, r := range s.records {
-		if r.Date == date {
-			out[r.Address] += r.Duration
-		}
-	}
-	return out
+	s.pruneLocked(time.Now())
+	return storeutil.WriteJSON(s.path, s.aggr, 0o644)
 }
 
-// SumByWeek 返回某 ISO 周（year, week）每个频道的累计秒数。
-func (s *Store) SumByWeek(year int, week int) map[string]int64 {
+// ClearAll 清空全部统计并落盘。
+func (s *Store) ClearAll() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make(map[string]int64)
-	for _, r := range s.records {
-		t, err := time.Parse("2006-01-02", r.Date)
-		if err != nil {
-			continue
-		}
-		y, w := t.ISOWeek()
-		if y == year && w == week {
-			out[r.Address] += r.Duration
-		}
-	}
-	return out
+	s.aggr = make(map[string]map[string]int64)
+	err := storeutil.WriteJSON(s.path, s.aggr, 0o644)
+	s.mu.Unlock()
+	return err
 }
 
-// SumByMonth 返回某月（year, month）每个频道的累计秒数。
-func (s *Store) SumByMonth(year int, month time.Month) map[string]int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make(map[string]int64)
-	for _, r := range s.records {
-		t, err := time.Parse("2006-01-02", r.Date)
-		if err != nil {
-			continue
-		}
-		if t.Year() == year && t.Month() == month {
-			out[r.Address] += r.Duration
-		}
-	}
-	return out
-}
-
-// HistoricalSum 返回某频道在指定日期的历史累计秒数（不含当天正在观看的流）。
+// HistoricalSum 返回某频道在指定日期的累计秒数（不含正在观看的当前流）。
 func (s *Store) HistoricalSum(address string, date string) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var total int64
-	for _, r := range s.records {
-		if r.Address == address && r.Date == date {
-			total += r.Duration
-		}
-	}
-	return total
+	return s.aggr[address][date]
 }
 
-// HistoricalSumWeek 返回某频道在指定 ISO 周的历史累计秒数。
+// HistoricalSumWeek 返回某频道在指定 ISO 周（year, week）的累计秒数。
 func (s *Store) HistoricalSumWeek(address string, year int, week int) int64 {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var total int64
-	for _, r := range s.records {
-		if r.Address != address {
-			continue
-		}
-		t, err := time.Parse("2006-01-02", r.Date)
+	for date, sec := range s.aggr[address] {
+		t, err := time.Parse("2006-01-02", date)
 		if err != nil {
 			continue
 		}
-		y, w := t.ISOWeek()
-		if y == year && w == week {
-			total += r.Duration
+		if y, w := t.ISOWeek(); y == year && w == week {
+			total += sec
 		}
 	}
 	return total
 }
 
-// Query 查询指定维度的统计结果，nameFn 用于将地址映射为频道名。
+// Query 查询指定维度（day/week/month）的统计结果，nameFn 用于地址->频道名映射。
+// top>0 时只返回前 top 名（total 仍为全量合计）。
 func (s *Store) Query(period string, dateStr string, top int, nameFn func(string) string) PeriodResult {
-	var m map[string]int64
-	now := time.Now()
+	s.mu.Lock()
+	aggr := s.aggr
+	s.mu.Unlock()
 
+	now := time.Now()
+	var weekYear, weekNo int
+	var monthYear int
+	var month time.Month
+	targetDate := now.Format("2006-01-02")
 	switch period {
 	case "week":
-		t := now
-		if dateStr != "" {
-			if parsed, err := time.Parse("2006-01-02", dateStr); err == nil {
-				t = parsed
-			}
-		}
-		y, w := t.ISOWeek()
-		m = s.SumByWeek(y, w)
+		t := parseOrNow(dateStr, now)
+		weekYear, weekNo = t.ISOWeek()
 	case "month":
-		t := now
-		if dateStr != "" {
-			if parsed, err := time.Parse("2006-01-02", dateStr); err == nil {
-				t = parsed
-			}
-		}
-		m = s.SumByMonth(t.Year(), t.Month())
+		t := parseOrNow(dateStr, now)
+		monthYear, month = t.Year(), t.Month()
 	default: // "day"
-		date := now.Format("2006-01-02")
 		if dateStr != "" {
-			date = dateStr
+			targetDate = dateStr
 		}
-		m = s.SumByDate(date)
+	}
+
+	perAddr := make(map[string]int64)
+	for addr, byDate := range aggr {
+		var sec int64
+		switch period {
+		case "week":
+			for d, v := range byDate {
+				if t, err := time.Parse("2006-01-02", d); err == nil {
+					if y, w := t.ISOWeek(); y == weekYear && w == weekNo {
+						sec += v
+					}
+				}
+			}
+		case "month":
+			for d, v := range byDate {
+				if t, err := time.Parse("2006-01-02", d); err == nil {
+					if t.Year() == monthYear && t.Month() == month {
+						sec += v
+					}
+				}
+			}
+		default:
+			sec = byDate[targetDate]
+		}
+		if sec > 0 {
+			perAddr[addr] = sec
+		}
 	}
 
 	var total int64
-	items := make([]RankItem, 0, len(m))
-	for addr, sec := range m {
+	items := make([]RankItem, 0, len(perAddr))
+	for addr, sec := range perAddr {
 		total += sec
-		name := ""
-		if nameFn != nil {
-			name = nameFn(addr)
-		}
-		items = append(items, RankItem{Address: addr, Name: name, Duration: sec})
+		items = append(items, RankItem{Address: addr, Duration: sec})
 	}
-	sort.Slice(items, func(i, j int) bool { return items[i].Duration > items[j].Duration })
+	sort.Slice(items, func(i, j int) bool {
+		if items[i].Duration != items[j].Duration {
+			return items[i].Duration > items[j].Duration
+		}
+		return items[i].Address < items[j].Address
+	})
 	for i := range items {
 		items[i].Rank = i + 1
+		if nameFn != nil {
+			items[i].Name = nameFn(items[i].Address)
+		}
 	}
 	if top > 0 && top < len(items) {
 		items = items[:top]
@@ -204,15 +260,27 @@ func (s *Store) Query(period string, dateStr string, top int, nameFn func(string
 	return PeriodResult{TotalSeconds: total, Channels: items}
 }
 
-// save 持久化到磁盘，调用方需持有 s.mu。
-func (s *Store) save() {
-	data, err := json.MarshalIndent(s.records, "", "  ")
-	if err != nil {
-		return
+// pruneLocked 裁掉保留期之外的历史数据（"YYYY-MM-DD" 字典序即时间序）。
+func (s *Store) pruneLocked(now time.Time) {
+	cutoff := now.AddDate(0, 0, -retentionDays).Format("2006-01-02")
+	for addr, byDate := range s.aggr {
+		for d := range byDate {
+			if d < cutoff {
+				delete(byDate, d)
+			}
+		}
+		if len(byDate) == 0 {
+			delete(s.aggr, addr)
+		}
 	}
-	tmpPath := s.path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return
+}
+
+func parseOrNow(dateStr string, now time.Time) time.Time {
+	if dateStr == "" {
+		return now
 	}
-	os.Rename(tmpPath, s.path)
+	if t, err := time.Parse("2006-01-02", dateStr); err == nil {
+		return t
+	}
+	return now
 }

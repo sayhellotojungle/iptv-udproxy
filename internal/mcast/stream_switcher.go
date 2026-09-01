@@ -9,10 +9,11 @@ import (
 )
 
 const (
-	tsPacketSize = 188
-	tsSyncByte   = 0x47
-	tsNullPID    = 0x1fff
-	clockMask    = uint64(1<<33 - 1)
+	tsPacketSize   = 188
+	tsSyncByte     = 0x47
+	tsNullPID      = 0x1fff
+	clockMask      = uint64(1<<33 - 1)
+	spsWindowTicks = 2 * 90000 // 候选源 SPS/PPS 容忍窗：2 秒（90kHz 时基）
 )
 
 // StreamSwitcher keeps one stable MPEG-TS program identity while switching
@@ -35,6 +36,8 @@ type StreamSwitcher struct {
 	havePreviousPTS  bool
 	lastPCR          uint64
 	havePCR          bool
+	patPsi           psiReassembler // 当前源 PAT 跨包重组
+	pmtPsi           psiReassembler // 当前源 PMT 跨包重组
 }
 
 type programProfile struct {
@@ -66,11 +69,56 @@ type candidateState struct {
 	haveVideoPTS bool
 	sps          []byte
 	pps          []byte
+	spsFoundPTS  uint64 // 最近一次在 AU 中见到 SPS/PPS 的视频 PTS
+	haveSPSPTS   bool
 	foundIDR     bool
 	firstPCR     uint64
 	havePCR      bool
 	lastCC       map[uint16]byte
 	haveCC       map[uint16]bool
+	patPsi       psiReassembler
+	pmtPsi       psiReassembler
+}
+
+// psiReassembler 累积被拆到多个 TS 包的 PSI section 流（长 PMT 常见），
+// 每凑齐一个完整 section（含 CRC）就交回给解析器。
+type psiReassembler struct {
+	buf []byte
+}
+
+// resetPSI 重开一段 PSI 重复（PUSI 包）：清空缓冲并消费 pointer field，
+// 返回真正从 section 头（table_id）开始的字节。非 PUSI 续包直接 feed 原始 payload。
+func (r *psiReassembler) resetPSI(payload []byte) []byte {
+	r.buf = nil
+	if len(payload) < 1 {
+		return nil
+	}
+	ptr := int(payload[0])
+	if ptr == 0xff || 1+ptr > len(payload) {
+		return nil
+	}
+	return payload[1+ptr:]
+}
+
+// feed 追加一段 payload，返回其中完整的 sections。
+func (r *psiReassembler) feed(chunk []byte) [][]byte {
+	r.buf = append(r.buf, chunk...)
+	var sections [][]byte
+	for {
+		for len(r.buf) > 0 && r.buf[0] == 0xff { // 跳过填充字节
+			r.buf = r.buf[1:]
+		}
+		if len(r.buf) < 3 {
+			break
+		}
+		total := 3 + (int(r.buf[1]&0x0f)<<8 | int(r.buf[2]))
+		if total < 5 || len(r.buf) < total {
+			break
+		}
+		sections = append(sections, append([]byte(nil), r.buf[:total]...))
+		r.buf = r.buf[total:]
+	}
+	return sections
 }
 
 // NewStreamSwitcher creates a per-client switcher.
@@ -84,6 +132,16 @@ func (s *StreamSwitcher) StartWaiting() {
 		lastCC: make(map[uint16]byte),
 		haveCC: make(map[uint16]bool),
 	}
+}
+
+// AbortCandidate 取消等待中的候选源并释放其已缓冲的 TS 包。
+// 切换取消（超时/不兼容/客户端断开）时必须调用，否则长 GOP 下缓冲数 MB 直到流程结束。
+func (s *StreamSwitcher) AbortCandidate() {
+	if s.candidate != nil {
+		s.candidate.packets = nil
+		s.candidate.videoES = nil
+	}
+	s.candidate = nil
 }
 
 // ProcessCurrent observes the initial source and transforms an activated
@@ -125,24 +183,43 @@ func (s *StreamSwitcher) ProcessCandidate(data []byte) ([]byte, bool, error) {
 				c.videoES = nil
 				c.buffering = false
 				c.foundIDR = false
+				// TS 不连续（流重启）：旧 SPS/PPS 可能属于旧流结构，一并作废
+				c.sps = nil
+				c.pps = nil
+				c.haveSPSPTS = false
 			}
 			c.lastCC[pid] = cc
 			c.haveCC[pid] = true
 		}
 		if pid == 0 {
-			if program, pmtPID, ok := parsePAT(packet); ok {
-				c.pmtPID = pmtPID
-				c.havePMTPID = true
-				if c.profile != nil && c.profile.programNumber != program {
-					return nil, false, fmt.Errorf("候选源 program number 从 %d 变为 %d", c.profile.programNumber, program)
+			if payload, ok := packetPayload(packet); ok {
+				// 每个 PUSI 包开始一段新的 PSI 重复；长 PAT/PMT 跨包重组
+				if packetPUSI(packet) {
+					payload = c.patPsi.resetPSI(payload)
+				}
+				for _, section := range c.patPsi.feed(payload) {
+					if program, pmtPID, ok := parsePAT(section); ok {
+						c.pmtPID = pmtPID
+						c.havePMTPID = true
+						if c.profile != nil && c.profile.programNumber != program {
+							return nil, false, fmt.Errorf("候选源 program number 从 %d 变为 %d", c.profile.programNumber, program)
+						}
+					}
 				}
 			}
 		}
 		if c.havePMTPID && pid == c.pmtPID {
-			if profile, ok := parsePMT(packet, c.pmtPID); ok {
-				c.profile = &profile
-				if err := s.checkCompatibility(profile); err != nil {
-					return nil, false, err
+			if payload, ok := packetPayload(packet); ok {
+				if packetPUSI(packet) {
+					payload = c.pmtPsi.resetPSI(payload)
+				}
+				for _, section := range c.pmtPsi.feed(payload) {
+					if profile, ok := parsePMT(section, c.pmtPID); ok {
+						c.profile = &profile
+						if err := s.checkCompatibility(profile); err != nil {
+							return nil, false, err
+						}
+					}
 				}
 			}
 		}
@@ -152,14 +229,21 @@ func (s *StreamSwitcher) ProcessCandidate(data []byte) ([]byte, bool, error) {
 		}
 
 		if pid == c.profile.videoPID && packetPUSI(packet) {
+			pts, havePts := packetPTS(packet)
+			// SPS/PPS 容忍窗：运营商常见做法是周期性单独插入 SPS/PPS（不与 IDR 同 AU）。
+			// 只要 SPS/PPS 出现在最近 spsWindowTicks（2 秒）内就保留，
+			// 让后续含 IDR 的 AU 可以复用；超出窗口的旧参数才作废。
+			if c.haveSPSPTS && havePts && (pts-c.spsFoundPTS)&clockMask > spsWindowTicks {
+				c.sps = nil
+				c.pps = nil
+				c.haveSPSPTS = false
+			}
 			c.packets = nil
 			c.videoES = nil
 			c.buffering = true
 			c.foundIDR = false
-			c.sps = nil
-			c.pps = nil
 			c.havePCR = false
-			c.videoPTS, c.haveVideoPTS = packetPTS(packet)
+			c.videoPTS, c.haveVideoPTS = pts, havePts
 		}
 		if c.buffering {
 			c.packets = append(c.packets, bytes.Clone(packet))
@@ -171,7 +255,16 @@ func (s *StreamSwitcher) ProcessCandidate(data []byte) ([]byte, bool, error) {
 			payload, ok := elementaryPayload(packet)
 			if ok {
 				c.videoES = append(c.videoES, payload...)
-				c.sps, c.pps, c.foundIDR = scanH264(c.videoES)
+				sps, pps, foundIDR := scanH264(c.videoES)
+				if len(sps) > 0 {
+					c.sps = sps
+					c.spsFoundPTS = c.videoPTS
+					c.haveSPSPTS = true
+				}
+				if len(pps) > 0 {
+					c.pps = pps
+				}
+				c.foundIDR = foundIDR
 			}
 		}
 	}
@@ -276,23 +369,37 @@ func (s *StreamSwitcher) makeTransform(source programProfile, offset int64) *sou
 func (s *StreamSwitcher) observeInitial(packet []byte) {
 	pid := packetPID(packet)
 	if pid == 0 {
-		if program, pmtPID, ok := parsePAT(packet); ok {
-			if s.canonical == nil {
-				s.canonical = &programProfile{programNumber: program, pmtPID: pmtPID}
-			} else {
-				s.canonical.programNumber = program
-				s.canonical.pmtPID = pmtPID
+		if payload, ok := packetPayload(packet); ok {
+			if packetPUSI(packet) {
+				payload = s.patPsi.resetPSI(payload)
 			}
-			if version, ok := psiVersion(packet); ok {
-				s.psiVersion = version
+			for _, section := range s.patPsi.feed(payload) {
+				if program, pmtPID, ok := parsePAT(section); ok {
+					if s.canonical == nil {
+						s.canonical = &programProfile{programNumber: program, pmtPID: pmtPID}
+					} else {
+						s.canonical.programNumber = program
+						s.canonical.pmtPID = pmtPID
+					}
+					if version, ok := psiVersion(packet); ok {
+						s.psiVersion = version
+					}
+					s.canonicalPAT = buildPATPacket(program, pmtPID, s.psiVersion)
+				}
 			}
-			s.canonicalPAT = buildPATPacket(program, pmtPID, s.psiVersion)
 		}
 	}
 	if s.canonical != nil && pid == s.canonical.pmtPID {
-		if profile, ok := parsePMT(packet, s.canonical.pmtPID); ok {
-			*s.canonical = profile
-			s.canonicalPMT = buildPMTPacket(profile.programNumber, profile.pmtPID, profile.pcrPID, profile.videoPID, profile.audioPID, profile.videoType, profile.audioType, s.psiVersion)
+		if payload, ok := packetPayload(packet); ok {
+			if packetPUSI(packet) {
+				payload = s.pmtPsi.resetPSI(payload)
+			}
+			for _, section := range s.pmtPsi.feed(payload) {
+				if profile, ok := parsePMT(section, s.canonical.pmtPID); ok {
+					*s.canonical = profile
+					s.canonicalPMT = buildPMTPacket(profile.programNumber, profile.pmtPID, profile.pcrPID, profile.videoPID, profile.audioPID, profile.videoType, profile.audioType, s.psiVersion)
+				}
+			}
 		}
 	}
 	if s.canonical == nil || s.canonical.videoPID == 0 || pid != s.canonical.videoPID {
@@ -523,9 +630,9 @@ func elementaryPayload(packet []byte) ([]byte, bool) {
 	return payload[offset:], true
 }
 
-func parsePAT(packet []byte) (uint16, uint16, bool) {
-	section, ok := psiSection(packet, 0x00)
-	if !ok || len(section) < 12 {
+// parsePAT 解析一个完整 PAT section（含 CRC，可由 psiReassembler 跨包拼出）。
+func parsePAT(section []byte) (uint16, uint16, bool) {
+	if len(section) < 12 || section[0] != 0x00 {
 		return 0, 0, false
 	}
 	sectionLength := int(section[1]&0x0f)<<8 | int(section[2])
@@ -544,9 +651,9 @@ func parsePAT(packet []byte) (uint16, uint16, bool) {
 	return 0, 0, false
 }
 
-func parsePMT(packet []byte, pmtPID uint16) (programProfile, bool) {
-	section, ok := psiSection(packet, 0x02)
-	if !ok || len(section) < 16 {
+// parsePMT 解析一个完整 PMT section（含 CRC，可由 psiReassembler 跨包拼出）。
+func parsePMT(section []byte, pmtPID uint16) (programProfile, bool) {
+	if len(section) < 16 || section[0] != 0x02 {
 		return programProfile{}, false
 	}
 	sectionLength := int(section[1]&0x0f)<<8 | int(section[2])
@@ -601,23 +708,6 @@ func psiVersion(packet []byte) (byte, bool) {
 		return 0, false
 	}
 	return (payload[offset+5] >> 1) & 0x1f, true
-}
-
-func psiSection(packet []byte, tableID byte) ([]byte, bool) {
-	payload, ok := packetPayload(packet)
-	if !ok || !packetPUSI(packet) || len(payload) < 1 {
-		return nil, false
-	}
-	offset := 1 + int(payload[0])
-	if offset+3 > len(payload) || payload[offset] != tableID {
-		return nil, false
-	}
-	sectionLength := int(payload[offset+1]&0x0f)<<8 | int(payload[offset+2])
-	end := offset + 3 + sectionLength
-	if end > len(payload) {
-		return nil, false
-	}
-	return payload[offset:end], true
 }
 
 func scanH264(data []byte) (sps, pps []byte, idr bool) {
@@ -751,12 +841,14 @@ func packetPCRBase(packet []byte) (uint64, bool) {
 	if afc != 2 && afc != 3 || len(packet) < 12 || packet[4] < 7 || packet[5]&0x10 == 0 {
 		return 0, false
 	}
+	// MPEG-2 规范布局：b3=base 8..2(7位)+保留位；b4 最高两位=base 1..0
 	field := packet[6:12]
 	return uint64(field[0])<<25 |
 		uint64(field[1])<<17 |
 		uint64(field[2])<<9 |
-		uint64(field[3])<<1 |
-		uint64(field[4]>>7), true
+		uint64((field[3]>>1)&0x7f)<<2 |
+		uint64((field[4]>>7)&1)<<1 |
+		uint64((field[4]>>6)&1), true
 }
 
 func rewritePCR(packet []byte, offset int64) {
@@ -765,23 +857,26 @@ func rewritePCR(packet []byte, offset int64) {
 		return
 	}
 	field := packet[6:12]
+	// MPEG-2 规范布局：b3=base 8..2(7位)+保留1；b4=base 1..0+保留01+PCR_ext(0)
 	base := uint64(field[0])<<25 |
 		uint64(field[1])<<17 |
 		uint64(field[2])<<9 |
-		uint64(field[3])<<1 |
-		uint64(field[4]>>7)
+		uint64((field[3]>>1)&0x7f)<<2 |
+		uint64((field[4]>>7)&1)<<1 |
+		uint64((field[4]>>6)&1)
 	base = addClock(base, offset)
 	field[0] = byte(base >> 25)
 	field[1] = byte(base >> 17)
 	field[2] = byte(base >> 9)
-	field[3] = byte(base >> 1)
-	field[4] = field[4]&0x7f | byte(base&1)<<7
+	field[3] = byte((base>>2)&0x7f)<<1 | 1
+	field[4] = byte((base>>1)&0x03) << 6 // base 1..0 + PCR_ext=0
+	field[5] = 0xff // 保留位 11111111
 }
 
 func buildPATPacket(program, pmtPID uint16, version byte) []byte {
 	section := []byte{
 		0x00, 0x00, 0x00, // table_id, section_syntax_indicator + section_length (placeholder)
-		byte(program >> 8), byte(program), // transport_stream_id
+		0x00, 0x01, // transport_stream_id（规范不要求与 program number 相同，固定 1）
 		0xc0 | (version&0x1f)<<1 | 0x01, // reserved + version_number + current_next_indicator
 		0x00, 0x00,                      // section_number, last_section_number
 		byte(program >> 8), byte(program), // program_number

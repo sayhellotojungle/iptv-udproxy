@@ -18,6 +18,8 @@ func TestParseRequestKeepsInputMode(t *testing.T) {
 		{path: "/http/239.1.1.1:1", wantErr: true},
 		{path: "/rtp/not-an-ip:1", wantErr: true},
 		{path: "/rtp/239.1.1.1:0", wantErr: true},
+		{path: "/rtp/192.168.1.100:10000", wantErr: true}, // 单播地址应拒绝
+		{path: "/udp/240.0.0.1:1000", wantErr: true},      // 保留段（非 224/4）应拒绝
 	}
 	for _, tt := range tests {
 		t.Run(tt.path, func(t *testing.T) {
@@ -57,11 +59,14 @@ func TestRTPInputDecoderStripsObservedExtensionHeader(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != len(ts) || got[0] != 0x47 {
-		t.Fatalf("decoded length=%d first=%02x", len(got), got[0])
+	if len(got) != 1 {
+		t.Fatalf("expected 1 TS payload, got %d", len(got))
 	}
-	for i := range got {
-		if got[i] != ts[i] {
+	if len(got[0]) != len(ts) || got[0][0] != 0x47 {
+		t.Fatalf("decoded length=%d first=%02x", len(got[0]), got[0][0])
+	}
+	for i := range got[0] {
+		if got[0][i] != ts[i] {
 			t.Fatalf("payload differs at byte %d", i)
 		}
 	}

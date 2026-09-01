@@ -5,7 +5,6 @@ import (
 	"context"
 	"log"
 	"net/http"
-	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -23,6 +22,9 @@ import (
 )
 
 var version = "1.2"
+
+// fallbackMcastIface 未配置组播网口时的兜底值（应通过 Web 界面配置，非通用默认）。
+const fallbackMcastIface = "enp2s0-ovs"
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmsgprefix)
@@ -59,12 +61,13 @@ func main() {
 	}
 	log.Printf("  已加载 %d 个频道", len(channelStore.List()))
 
-	// 初始化观看时长统计存储
+	// 初始化观看时长统计存储（损坏时已备份并以空统计起步）
 	statsPath := cfg.DataDir + "/watchtime.json"
 	statsStore, err := stats.Open(statsPath)
 	if err != nil {
 		log.Fatalf("加载观看时长文件失败: %v", err)
 	}
+	defer statsStore.Close() // 末次落盘，保证退出不丢已聚合数据
 
 	// 初始化限制规则存储
 	limitsPath := cfg.DataDir + "/limits.json"
@@ -82,13 +85,15 @@ func main() {
 		Unit:  appSettings.PPPoEUnit,
 	}
 	pppoeMgr := pppoe.New(pppoeCfg, cfg.DataDir)
+	defer pppoeMgr.Stop() // 确保任何退出路径（含 HTTP 致命错误）都拆除 pppd/系统状态
 	pppoeMgr.SetEnabled(appSettings.PPPoEEnable)
 	pppoeMgr.SetOnDemand(appSettings.OnDemand)
 
 	// 路由守卫（始终创建，配置可动态更新）
 	mcastIface := appSettings.McastIface
 	if mcastIface == "" {
-		mcastIface = "enp2s0-ovs"
+		mcastIface = fallbackMcastIface
+		log.Printf("[main] 警告: 未配置组播网口，兜底使用 %s，请在网页界面配置", mcastIface)
 	}
 	guard := routeguard.New(mcastIface, pppoeMgr.IfaceName(), true)
 	guard.SetBlockPPPoE(appSettings.PPPoEEnable)
@@ -117,6 +122,9 @@ func main() {
 	relayMgr.SetLimits(limitsStore)
 	relayMgr.SetIdleTimeout(time.Duration(appSettings.IdleTimeout) * time.Second)
 
+	// 统计存储：30 秒定时落盘，ctx 结束即停（末次落盘由 Close 完成）
+	statsStore.Start(ctx)
+
 	// 启动幽灵订阅清除（使用全局 context，关闭信号时自动退出）
 	relayMgr.StartCleanup(ctx)
 
@@ -134,7 +142,8 @@ func main() {
 
 		mcastIface := newSettings.McastIface
 		if mcastIface == "" {
-			mcastIface = "enp2s0-ovs"
+			mcastIface = fallbackMcastIface
+			log.Printf("[main] 警告: 未配置组播网口，兜底使用 %s", mcastIface)
 		}
 		relayMgr.SetIface(mcastIface)
 		guard.UpdateConfig(mcastIface, pppoeMgr.IfaceName(), true)
@@ -157,20 +166,26 @@ func main() {
 		IdleTimeout:  120 * time.Second,
 	}
 
+	// HTTP 致命错误（如端口占用）不再 log.Fatalf 直接杀进程——那会跳过所有 defer
+	// （guard/pppoe/stats 落盘）。改为通知主流程走统一关闭路径。
+	httpErr := make(chan error, 1)
 	go func() {
 		log.Printf("[main] HTTP 服务已启动: %s", cfg.Listen)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("HTTP 服务异常: %v", err)
+			httpErr <- err
 		}
 	}()
 
-	<-ctx.Done()
-	log.Println("[main] 收到关闭信号，正在停止...")
+	select {
+	case <-ctx.Done():
+		log.Println("[main] 收到关闭信号，正在停止...")
+	case err := <-httpErr:
+		log.Printf("[main] HTTP 服务异常，正在停止: %v", err)
+	}
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
-	pppoeMgr.Stop()
+	// pppoe.Stop / statsStore.Close / guard.Stop 由 defer 完成
 	log.Println("[main] 已退出")
-	os.Exit(0)
 }

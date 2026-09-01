@@ -2,11 +2,11 @@
 package settings
 
 import (
-	"encoding/json"
 	"log"
 	"net"
-	"os"
 	"sync"
+
+	"iptv-udpproxy/internal/storeutil"
 )
 
 // Config 运行时配置。
@@ -61,37 +61,28 @@ func (s *Store) SetOnChange(fn func(cfg Config)) {
 	s.onChange = fn
 }
 
-// Load 从文件加载配置。
+// Load 从文件加载配置。文件损坏时备份并以默认配置起步（显著告警，
+// 不再静默覆盖用户数据）；文件不存在则使用默认配置。
 func (s *Store) Load() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	data, err := os.ReadFile(s.path)
+	corrupted, err := storeutil.LoadJSON(s.path, &s.cfg)
 	if err != nil {
-		if os.IsNotExist(err) {
-			return nil // 文件不存在，使用默认配置
-		}
 		return err
 	}
-
-	return json.Unmarshal(data, &s.cfg)
+	if corrupted {
+		log.Printf("[settings] 警告: 设置文件 %s 损坏已备份，本次使用默认配置，请在网页重新确认 PPPoE 等设置", s.path)
+	}
+	return nil
 }
 
-// Save 保存配置到文件。
+// Save 原子保存配置到文件。权限 0600：文件内含明文 PPPoE 密码。
 func (s *Store) Save() error {
 	s.mu.RLock()
-	data, err := json.MarshalIndent(s.cfg, "", "  ")
+	cfg := s.cfg
 	s.mu.RUnlock()
-	if err != nil {
-		return err
-	}
-
-	// 原子写入
-	tmpPath := s.path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, s.path)
+	return storeutil.WriteJSON(s.path, cfg, 0o600)
 }
 
 // Get 获取当前配置。
@@ -101,7 +92,8 @@ func (s *Store) Get() Config {
 	return s.cfg
 }
 
-// Update 更新配置并保存。
+// Update 更新配置并保存。onChange 在保存成功后【同步】调用：
+// 调用方（Web 请求）返回前各管理器已应用新配置，避免"页面已保存但拨号参数未生效"的窗口。
 func (s *Store) Update(cfg Config) error {
 	s.mu.Lock()
 	s.cfg = cfg
@@ -115,7 +107,7 @@ func (s *Store) Update(cfg Config) error {
 	log.Printf("[settings] 配置已更新")
 
 	if onChange != nil {
-		go onChange(cfg)
+		onChange(cfg)
 	}
 
 	return nil

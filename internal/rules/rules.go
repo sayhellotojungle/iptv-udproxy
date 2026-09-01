@@ -7,12 +7,12 @@ package rules
 import (
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/netip"
-	"os"
 	"sync"
 	"time"
+
+	"iptv-udpproxy/internal/storeutil"
 )
 
 // Rule 一条换源规则。
@@ -34,20 +34,14 @@ type Store struct {
 	rules []Rule
 }
 
-// Open 加载（或初始化）规则文件。
+// Open 加载（或初始化）规则文件。文件损坏时备份后以空规则起步，不 fatal。
 func Open(path string) (*Store, error) {
-	s := &Store{path: path}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return s, nil
-		}
+	s := &Store{path: path, rules: []Rule{}}
+	if _, err := storeutil.LoadJSON(path, &s.rules); err != nil {
 		return nil, err
 	}
-	if len(data) > 0 {
-		if err := json.Unmarshal(data, &s.rules); err != nil {
-			return nil, fmt.Errorf("解析规则文件 %s 失败: %w", path, err)
-		}
+	if s.rules == nil {
+		s.rules = []Rule{}
 	}
 	return s, nil
 }
@@ -221,11 +215,7 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-// save 持久化到磁盘，调用方需持有 s.mu。
+// save 原子持久化到磁盘，调用方需持有 s.mu。
 func (s *Store) save() error {
-	data, err := json.MarshalIndent(s.rules, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(s.path, data, 0o644)
+	return storeutil.WriteJSON(s.path, s.rules, 0o644)
 }

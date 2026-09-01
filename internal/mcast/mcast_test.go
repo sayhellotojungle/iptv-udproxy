@@ -11,8 +11,8 @@ func TestBroadcastReportsOverflowInsteadOfSilentDrop(t *testing.T) {
 	unsub, errCh := r.Subscribe(ch)
 	defer unsub()
 
-	r.broadcast([]byte{1}, 1)
-	r.broadcast([]byte{2}, 1)
+	r.broadcast([]byte{1})
+	r.broadcast([]byte{2})
 
 	select {
 	case err := <-errCh:
@@ -26,7 +26,7 @@ func TestBroadcastReportsOverflowInsteadOfSilentDrop(t *testing.T) {
 		t.Fatalf("subscriber count = %d, want 0", got)
 	}
 	packet := <-ch
-	if packet.N != 1 || len(packet.Data) != 1 || packet.Data[0] != 1 {
+	if len(packet.Data) != 1 || packet.Data[0] != 1 {
 		t.Fatalf("first queued packet changed: %+v", packet)
 	}
 }

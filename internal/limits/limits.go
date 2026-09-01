@@ -10,11 +10,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
-	"os"
 	"sync"
 	"time"
 
 	"iptv-udpproxy/internal/stats"
+	"iptv-udpproxy/internal/storeutil"
 )
 
 // Limit 一条观看时长限制规则。
@@ -47,35 +47,55 @@ type Store struct {
 	pool   PoolConfig
 }
 
-// Open 加载或初始化限制规则文件。
+// Open 加载或初始化限制规则文件。损坏时备份后以空配置起步；
+// 兼容新格式 {limits, pool} 与旧格式纯 []Limit。
 func Open(path string) (*Store, error) {
-	s := &Store{path: path}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return s, nil
-		}
+	s := &Store{
+		path:   path,
+		limits: []Limit{},
+		pool:   PoolConfig{Addresses: []string{}},
+	}
+	var fd fileData
+	if _, err := storeutil.LoadJSON(path, &fd); err != nil {
 		return nil, err
 	}
-	if len(data) > 0 {
-		// 兼容旧格式：可能是 []Limit 或新格式 {limits, pool}
-		var wrapper struct {
-			Limits []Limit     `json:"limits"`
-			Pool   PoolConfig  `json:"pool"`
-		}
-		if err := json.Unmarshal(data, &wrapper); err == nil && (len(wrapper.Limits) > 0 || len(wrapper.Pool.Addresses) > 0) {
-			s.limits = wrapper.Limits
-			s.pool = wrapper.Pool
-		} else {
-			// 尝试旧格式：纯数组
-			var arr []Limit
-			if err2 := json.Unmarshal(data, &arr); err2 != nil {
-				return nil, fmt.Errorf("解析限制文件 %s 失败: %w", path, err)
-			}
-			s.limits = arr
-		}
+	s.limits = fd.limits
+	if s.limits == nil {
+		s.limits = []Limit{}
+	}
+	s.pool = fd.pool
+	if s.pool.Addresses == nil {
+		s.pool.Addresses = []string{}
 	}
 	return s, nil
+}
+
+// fileData 限制文件磁盘格式（新/旧格式双兼容）。
+type fileData struct {
+	limits []Limit
+	pool   PoolConfig
+}
+
+func (f *fileData) UnmarshalJSON(data []byte) error {
+	var wrapper struct {
+		Limits []Limit    `json:"limits"`
+		Pool   PoolConfig `json:"pool"`
+	}
+	// 文件是 JSON 对象即视为新格式（含空规则+空池的合法落盘内容），
+	// 避免合法空文件被误判损坏；对象解析失败才尝试旧版纯数组格式。
+	if err := json.Unmarshal(data, &wrapper); err == nil {
+		f.limits = wrapper.Limits
+		f.pool = wrapper.Pool
+		return nil
+	}
+	var arr []Limit
+	if err := json.Unmarshal(data, &arr); err != nil {
+		// 既非新格式也非数组（含非法 JSON）：报错让 LoadJSON 走损坏备份
+		return fmt.Errorf("无法识别的限制文件格式")
+	}
+	f.limits = arr
+	f.pool = PoolConfig{Addresses: []string{}}
+	return nil
 }
 
 // ListLimits 返回所有限制规则副本。
@@ -169,16 +189,18 @@ func (s *Store) HasLimit(address string) bool {
 // liveElapsed 为当前流的实时时长（time.Since），stats 提供历史数据。
 func (s *Store) CheckLimit(address string, statStore *stats.Store, liveElapsed time.Duration, now time.Time) *ExceedResult {
 	s.mu.Lock()
-	var lim *Limit
+	var lim Limit
+	found := false
 	for i := range s.limits {
 		if s.limits[i].Enabled && s.limits[i].Address == address {
-			lim = &s.limits[i]
+			lim = s.limits[i] // 值拷贝：锁外读取不与并发 UpdateLimit 竞争
+			found = true
 			break
 		}
 	}
 	s.mu.Unlock()
 
-	if lim == nil {
+	if !found {
 		return nil
 	}
 
@@ -264,22 +286,13 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-// save 持久化到磁盘，调用方需持有 s.mu。
+// save 原子持久化到磁盘，调用方需持有 s.mu。
 func (s *Store) save() error {
-	wrapper := struct {
+	return storeutil.WriteJSON(s.path, struct {
 		Limits []Limit    `json:"limits"`
 		Pool   PoolConfig `json:"pool"`
 	}{
 		Limits: s.limits,
 		Pool:   s.pool,
-	}
-	data, err := json.MarshalIndent(wrapper, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmpPath := s.path + ".tmp"
-	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
-		return err
-	}
-	return os.Rename(tmpPath, s.path)
+	}, 0o644)
 }

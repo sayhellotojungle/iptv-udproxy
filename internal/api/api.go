@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"iptv-udpproxy/internal/channels"
 	"iptv-udpproxy/internal/limits"
@@ -47,30 +48,67 @@ func New(relay *relay.Manager, pppoeMgr *pppoe.Manager, ruleStore *rules.Store, 
 
 // RegisterRoutes 注册所有路由。
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
+	sub := http.NewServeMux()
+
 	// 组播流端点
-	mux.Handle("/rtp/", h.relay)
-	mux.Handle("/udp/", h.relay)
+	sub.Handle("/rtp/", h.relay)
+	sub.Handle("/udp/", h.relay)
+
+	// 健康检查（Docker HEALTHCHECK 用）
+	sub.HandleFunc("/healthz", h.handleHealthz)
 
 	// API
-	mux.HandleFunc("/api/status", h.handleStatus)
-	mux.HandleFunc("/api/streams", h.handleStreams)
-	mux.HandleFunc("/api/rules", h.handleRules)
-	mux.HandleFunc("/api/rules/", h.handleRuleByID)
-	mux.HandleFunc("/api/channels", h.handleChannels)
-	mux.HandleFunc("/api/channels/", h.handleChannelByID)
-	mux.HandleFunc("/api/channels/import", h.handleChannelsImport)
-	mux.HandleFunc("/api/m3u", h.handleM3U)
-	mux.HandleFunc("/api/pppoe/retry", h.handlePPPoERetry)
-	mux.HandleFunc("/api/interfaces", h.handleInterfaces)
-	mux.HandleFunc("/api/settings", h.handleSettings)
-	mux.HandleFunc("/api/watchtime", h.handleWatchtime)
-	mux.HandleFunc("/api/limits", h.handleLimits)
-	mux.HandleFunc("/api/limits/", h.handleLimitByID)
-	mux.HandleFunc("/api/limits/pool", h.handlePool)
+	sub.HandleFunc("/api/status", h.handleStatus)
+	sub.HandleFunc("/api/streams", h.handleStreams)
+	sub.HandleFunc("/api/rules", h.handleRules)
+	sub.HandleFunc("/api/rules/", h.handleRuleByID)
+	sub.HandleFunc("/api/channels", h.handleChannels)
+	sub.HandleFunc("/api/channels/", h.handleChannelByID)
+	sub.HandleFunc("/api/channels/import", h.handleChannelsImport)
+	sub.HandleFunc("/api/m3u", h.handleM3U)
+	sub.HandleFunc("/api/pppoe/retry", h.handlePPPoERetry)
+	sub.HandleFunc("/api/interfaces", h.handleInterfaces)
+	sub.HandleFunc("/api/settings", h.handleSettings)
+	sub.HandleFunc("/api/watchtime", h.handleWatchtime)
+	sub.HandleFunc("/api/limits", h.handleLimits)
+	sub.HandleFunc("/api/limits/", h.handleLimitByID)
+	sub.HandleFunc("/api/limits/pool", h.handlePool)
 
 	// Web 控制台
-	mux.HandleFunc("/", h.handleIndex)
-	mux.HandleFunc("/settings", h.handleSettingsPage)
+	sub.HandleFunc("/", h.handleIndex)
+	sub.HandleFunc("/settings", h.handleSettingsPage)
+
+	// /api/ 与 /healthz 请求记录访问日志（状态码 + 耗时）；
+	// 组播流是长连接，逐包日志无意义，只在连接建立时记一条。
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") || r.URL.Path == "/healthz" {
+			start := time.Now()
+			lw := &statusRecorder{ResponseWriter: w, code: 200}
+			sub.ServeHTTP(lw, r)
+			log.Printf("[http] %s %s -> %d (%s)", r.Method, r.URL.Path, lw.code, time.Since(start).Round(time.Millisecond))
+			return
+		}
+		if r.URL.Path == "/" || strings.HasPrefix(r.URL.Path, "/rtp/") || strings.HasPrefix(r.URL.Path, "/udp/") {
+			log.Printf("[http] %s %s", r.Method, r.URL.Path)
+		}
+		sub.ServeHTTP(w, r)
+	})
+}
+
+// statusRecorder 捕获响应状态码用于访问日志。
+type statusRecorder struct {
+	http.ResponseWriter
+	code int
+}
+
+func (r *statusRecorder) WriteHeader(code int) {
+	r.code = code
+	r.ResponseWriter.WriteHeader(code)
+}
+
+// handleHealthz 简单健康检查，进程活着即返回 ok。
+func (h *Handler) handleHealthz(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, map[string]string{"status": "ok"})
 }
 
 // ---------- API Handlers ----------
@@ -78,22 +116,27 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 // GET /api/status 返回服务整体状态。
 func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 		return
 	}
 	pppStatus := h.pppoe.Status()
 	streams := h.relay.ActiveStreams()
+	limitBlocked := h.relay.LimitBlocked()
+	if limitBlocked == nil {
+		limitBlocked = []string{}
+	}
 	writeJSON(w, map[string]any{
-		"version":       h.version,
-		"pppoe":         pppStatus,
+		"version":        h.version,
+		"pppoe":          pppStatus,
 		"active_streams": len(streams),
+		"limit_blocked":  limitBlocked,
 	})
 }
 
 // GET /api/streams 返回当前活跃流列表。
 func (h *Handler) handleStreams(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 		return
 	}
 	writeJSON(w, h.relay.ActiveStreams())
@@ -111,17 +154,17 @@ func (h *Handler) handleRules(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var rule rules.Rule
 		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
-			http.Error(w, "JSON 解析失败: "+err.Error(), 400)
+			writeError(w, 400, "JSON 解析失败: "+err.Error())
 			return
 		}
 		created, err := h.rules.Add(rule)
 		if err != nil {
-			http.Error(w, err.Error(), 400)
+			writeError(w, 400, err.Error())
 			return
 		}
 		writeJSON(w, created)
 	default:
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 	}
 }
 
@@ -129,7 +172,7 @@ func (h *Handler) handleRules(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleRuleByID(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/rules/")
 	if id == "" {
-		http.Error(w, "缺少规则 ID", 400)
+		writeError(w, 400, "缺少规则 ID")
 		return
 	}
 	switch r.Method {
@@ -140,34 +183,34 @@ func (h *Handler) handleRuleByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		http.Error(w, "规则不存在", 404)
+		writeError(w, 404, "规则不存在")
 	case http.MethodPut:
 		var rule rules.Rule
 		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
-			http.Error(w, "JSON 解析失败: "+err.Error(), 400)
+			writeError(w, 400, "JSON 解析失败: "+err.Error())
 			return
 		}
 		updated, err := h.rules.Update(id, rule)
 		if err != nil {
-			http.Error(w, err.Error(), 404)
+			writeError(w, 404, err.Error())
 			return
 		}
 		writeJSON(w, updated)
 	case http.MethodDelete:
 		if err := h.rules.Delete(id); err != nil {
-			http.Error(w, err.Error(), 404)
+			writeError(w, 404, err.Error())
 			return
 		}
 		writeJSON(w, map[string]string{"status": "deleted"})
 	default:
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 	}
 }
 
 // POST /api/pppoe/retry 重新拨号。
 func (h *Handler) handlePPPoERetry(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 		return
 	}
 	go func() {
@@ -179,13 +222,8 @@ func (h *Handler) handlePPPoERetry(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET/POST /api/channels 频道列表/添加。
+// 注意：/api/channels/import 由路由表中的更精确前缀直接分发到 handleChannelsImport。
 func (h *Handler) handleChannels(w http.ResponseWriter, r *http.Request) {
-	// 检查是否是导入请求
-	if r.URL.Path == "/api/channels/import" {
-		h.handleChannelsImport(w, r)
-		return
-	}
-
 	switch r.Method {
 	case http.MethodGet:
 		list := h.channels.List()
@@ -196,54 +234,55 @@ func (h *Handler) handleChannels(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var ch channels.Channel
 		if err := json.NewDecoder(r.Body).Decode(&ch); err != nil {
-			http.Error(w, "JSON 解析失败: "+err.Error(), 400)
+			writeError(w, 400, "JSON 解析失败: "+err.Error())
 			return
 		}
 		created, err := h.channels.Add(ch)
 		if err != nil {
-			http.Error(w, err.Error(), 400)
+			writeError(w, 400, err.Error())
 			return
 		}
 		writeJSON(w, created)
 	default:
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 	}
 }
 
 // PUT/DELETE /api/channels/{id}
 func (h *Handler) handleChannelByID(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/channels/")
-	if id == "" || id == "import" {
+	if id == "" {
+		writeError(w, 400, "缺少频道 ID")
 		return
 	}
 	switch r.Method {
 	case http.MethodPut:
 		var ch channels.Channel
 		if err := json.NewDecoder(r.Body).Decode(&ch); err != nil {
-			http.Error(w, "JSON 解析失败: "+err.Error(), 400)
+			writeError(w, 400, "JSON 解析失败: "+err.Error())
 			return
 		}
 		updated, err := h.channels.Update(id, ch)
 		if err != nil {
-			http.Error(w, err.Error(), 404)
+			writeError(w, 404, err.Error())
 			return
 		}
 		writeJSON(w, updated)
 	case http.MethodDelete:
 		if err := h.channels.Delete(id); err != nil {
-			http.Error(w, err.Error(), 404)
+			writeError(w, 404, err.Error())
 			return
 		}
 		writeJSON(w, map[string]string{"status": "deleted"})
 	default:
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 	}
 }
 
 // POST /api/channels/import 导入 m3u。
 func (h *Handler) handleChannelsImport(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 		return
 	}
 
@@ -256,13 +295,13 @@ func (h *Handler) handleChannelsImport(w http.ResponseWriter, r *http.Request) {
 		r.ParseMultipartForm(10 << 20) // 10MB
 		file, _, err := r.FormFile("file")
 		if err != nil {
-			http.Error(w, "读取文件失败: "+err.Error(), 400)
+			writeError(w, 400, "读取文件失败: "+err.Error())
 			return
 		}
 		defer file.Close()
 		data, err := io.ReadAll(file)
 		if err != nil {
-			http.Error(w, "读取文件失败: "+err.Error(), 400)
+			writeError(w, 400, "读取文件失败: "+err.Error())
 			return
 		}
 		content = string(data)
@@ -272,14 +311,14 @@ func (h *Handler) handleChannelsImport(w http.ResponseWriter, r *http.Request) {
 			Content string `json:"content"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "JSON 解析失败: "+err.Error(), 400)
+			writeError(w, 400, "JSON 解析失败: "+err.Error())
 			return
 		}
 		content = body.Content
 	}
 
 	if content == "" {
-		http.Error(w, "内容不能为空", 400)
+		writeError(w, 400, "内容不能为空")
 		return
 	}
 
@@ -290,7 +329,7 @@ func (h *Handler) handleChannelsImport(w http.ResponseWriter, r *http.Request) {
 // GET /api/m3u 生成 m3u 文件。
 func (h *Handler) handleM3U(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 		return
 	}
 
@@ -313,57 +352,67 @@ func (h *Handler) handleSettings(w http.ResponseWriter, r *http.Request) {
 		pppoeCfg := h.pppoe.GetConfig()
 		// 合并 pppoe 配置
 		cfg.PPPoEUser = pppoeCfg.User
-		cfg.PPPoEPass = pppoeCfg.Pass
 		cfg.PPPoEUnit = pppoeCfg.Unit
 		cfg.PPPoEIface = pppoeCfg.Iface
+		// 密码脱敏：响应只带掩码，不再把明文密码发给前端
+		// 管理器或设置文件任一有密码即掩码，防止二者失步（如手工改文件）时泄漏明文
+		if pppoeCfg.Pass != "" || cfg.PPPoEPass != "" {
+			cfg.PPPoEPass = "******"
+		}
 		writeJSON(w, cfg)
 
 	case http.MethodPut:
 		var cfg settings.Config
 		if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
-			http.Error(w, "JSON 解析失败: "+err.Error(), 400)
+			writeError(w, 400, "JSON 解析失败: "+err.Error())
 			return
 		}
 
-		// 更新 PPPoE 管理器配置
-		h.pppoe.UpdateConfig(pppoe.Config{
-			Iface: cfg.PPPoEIface,
-			User:  cfg.PPPoEUser,
-			Pass:  cfg.PPPoEPass,
-			Unit:  cfg.PPPoEUnit,
-		})
+		// 密码为掩码或空 = 保持现有密码（前端 GET 只拿到掩码）
+		if cfg.PPPoEPass == "" || cfg.PPPoEPass == "******" {
+			cfg.PPPoEPass = h.pppoe.GetConfig().Pass
+		}
 
-		// 保存设置
+		// 保存设置；pppoe/relay/guard 的配置应用由 settings.Update 的 onChange
+		// 回调同步完成，这里不再重复调用 UpdateConfig（双路径易竞态）
 		if err := h.settings.Update(cfg); err != nil {
-			http.Error(w, "保存配置失败: "+err.Error(), 500)
+			writeError(w, 500, "保存配置失败: "+err.Error())
 			return
 		}
 
 		writeJSON(w, map[string]string{"status": "ok"})
 
 	default:
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 	}
 }
 
 // GET /api/interfaces 获取网络接口列表。
 func (h *Handler) handleInterfaces(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 		return
 	}
 	ifaces, err := settings.ListInterfaces()
 	if err != nil {
-		http.Error(w, "获取接口列表失败: "+err.Error(), 500)
+		writeError(w, 500, "获取接口列表失败: "+err.Error())
 		return
 	}
 	writeJSON(w, ifaces)
 }
 
-// GET /api/watchtime 查询观看时长统计。
+// GET /api/watchtime 查询观看时长统计；DELETE 清空全部统计。
 func (h *Handler) handleWatchtime(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodDelete {
+		if err := h.stats.ClearAll(); err != nil {
+			writeError(w, 500, "清空统计失败: "+err.Error())
+			return
+		}
+		writeJSON(w, map[string]string{"status": "ok"})
+		return
+	}
 	if r.Method != http.MethodGet {
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 		return
 	}
 	period := r.URL.Query().Get("period")
@@ -383,12 +432,8 @@ func (h *Handler) handleWatchtime(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET/POST /api/limits 限制规则列表/新增。
+// 注意：/api/limits/pool 由路由表中的更精确前缀直接分发到 handlePool。
 func (h *Handler) handleLimits(w http.ResponseWriter, r *http.Request) {
-	// 检查子路径
-	if r.URL.Path == "/api/limits/pool" {
-		h.handlePool(w, r)
-		return
-	}
 	switch r.Method {
 	case http.MethodGet:
 		list := h.limits.ListLimits()
@@ -399,24 +444,25 @@ func (h *Handler) handleLimits(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPost:
 		var lim limits.Limit
 		if err := json.NewDecoder(r.Body).Decode(&lim); err != nil {
-			http.Error(w, "JSON 解析失败: "+err.Error(), 400)
+			writeError(w, 400, "JSON 解析失败: "+err.Error())
 			return
 		}
 		created, err := h.limits.AddLimit(lim)
 		if err != nil {
-			http.Error(w, err.Error(), 400)
+			writeError(w, 400, err.Error())
 			return
 		}
 		writeJSON(w, created)
 	default:
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 	}
 }
 
 // GET/PUT/DELETE /api/limits/{id}
 func (h *Handler) handleLimitByID(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/api/limits/")
-	if id == "" || id == "pool" {
+	if id == "" {
+		writeError(w, 400, "缺少限制规则 ID")
 		return
 	}
 	switch r.Method {
@@ -427,27 +473,27 @@ func (h *Handler) handleLimitByID(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
-		http.Error(w, "限制规则不存在", 404)
+		writeError(w, 404, "限制规则不存在")
 	case http.MethodPut:
 		var lim limits.Limit
 		if err := json.NewDecoder(r.Body).Decode(&lim); err != nil {
-			http.Error(w, "JSON 解析失败: "+err.Error(), 400)
+			writeError(w, 400, "JSON 解析失败: "+err.Error())
 			return
 		}
 		updated, err := h.limits.UpdateLimit(id, lim)
 		if err != nil {
-			http.Error(w, err.Error(), 404)
+			writeError(w, 404, err.Error())
 			return
 		}
 		writeJSON(w, updated)
 	case http.MethodDelete:
 		if err := h.limits.DeleteLimit(id); err != nil {
-			http.Error(w, err.Error(), 404)
+			writeError(w, 404, err.Error())
 			return
 		}
 		writeJSON(w, map[string]string{"status": "deleted"})
 	default:
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 	}
 }
 
@@ -463,16 +509,16 @@ func (h *Handler) handlePool(w http.ResponseWriter, r *http.Request) {
 	case http.MethodPut:
 		var pool limits.PoolConfig
 		if err := json.NewDecoder(r.Body).Decode(&pool); err != nil {
-			http.Error(w, "JSON 解析失败: "+err.Error(), 400)
+			writeError(w, 400, "JSON 解析失败: "+err.Error())
 			return
 		}
 		if err := h.limits.SetPool(pool); err != nil {
-			http.Error(w, err.Error(), 400)
+			writeError(w, 400, err.Error())
 			return
 		}
 		writeJSON(w, map[string]string{"status": "ok"})
 	default:
-		http.Error(w, "Method Not Allowed", 405)
+		writeError(w, 405, "Method Not Allowed")
 	}
 }
 
@@ -495,6 +541,13 @@ func writeJSON(w http.ResponseWriter, v any) {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	_ = enc.Encode(v)
+}
+
+// writeError 统一 JSON 错误响应：{"error": "..."}，前端统一按 .error 取错误文案。
+func writeError(w http.ResponseWriter, code int, msg string) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": msg})
 }
 
 // ---------- HTML Template ----------
@@ -572,6 +625,9 @@ select{min-width:200px}
 </div>
 
 <h1>IPTV UDProxy 控制台</h1>
+
+<!-- 时长限制告警 banner（limit_blocked 非空时显示） -->
+<div id="limit-banner" style="display:none;background:#7f1d1d;border:1px solid #dc2626;color:#fecaca;border-radius:8px;padding:10px 14px;margin-bottom:16px;font-size:.9rem"></div>
 
 <!-- 服务状态 -->
 <div class="card" id="status-card">
@@ -739,6 +795,16 @@ function loadStatus() {
       '<div class="stat-item"><div class="stat-value">' + esc(d.active_streams) + '</div><div class="stat-label">活跃流数</div></div>';
     
     document.getElementById('stream-count').textContent = d.active_streams || 0;
+
+    // 时长限制告警：有频道进入 limit_blocked 时顶部红 banner 提示
+    const banner = document.getElementById('limit-banner');
+    if (d.limit_blocked && d.limit_blocked.length) {
+      const names = d.limit_blocked.map(a => channelName(a) || a).join('、');
+      banner.innerHTML = '警告：以下频道当前无法新开播（已触发时长限制）：' + esc(names) + '。若备选地址池为空，时长限制实际不生效，请在"限制"页配置备选地址池或移除限制规则。';
+      banner.style.display = 'block';
+    } else {
+      banner.style.display = 'none';
+    }
   }).catch(e => {});
 }
 
@@ -1372,7 +1438,10 @@ function loadSettings() {
     .then(cfg => {
       document.getElementById('pppoe_enable').checked = cfg.pppoe_enable;
       document.getElementById('pppoe_user').value = cfg.pppoe_user || '';
-      document.getElementById('pppoe_pass').value = cfg.pppoe_pass || '';
+      // 密码不回显：后端只返回掩码，留空表示保持现有密码
+      const passEl = document.getElementById('pppoe_pass');
+      passEl.value = '';
+      passEl.placeholder = cfg.pppoe_pass ? '留空保持当前密码' : '密码';
       document.getElementById('pppoe_unit').value = cfg.pppoe_unit || 60;
       document.getElementById('on_demand').checked = cfg.on_demand;
       document.getElementById('idle_timeout').value = cfg.idle_timeout || 300;
