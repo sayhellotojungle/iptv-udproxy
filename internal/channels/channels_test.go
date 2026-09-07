@@ -36,9 +36,15 @@ func TestImportM3U(t *testing.T) {
 	if !ok || c1.Name != "CCTV-1" || c1.Group != "央视" || c1.Logo != "http://example.com/1.png" {
 		t.Fatalf("rtp 频道信息错误: %+v ok=%v", c1, ok)
 	}
+	if c1.EPGID != "cctv1" || c1.Mode != "rtp" {
+		t.Fatalf("rtp 频道 tvg-id/模式错误: epg_id=%q mode=%q", c1.EPGID, c1.Mode)
+	}
 	c2, ok := s.Get("239.69.1.123:10376")
 	if !ok || c2.Name != "湖南卫视" || c2.Group != "卫视" {
 		t.Fatalf("udp 频道（逗号回退名）错误: %+v ok=%v", c2, ok)
+	}
+	if c2.Mode != "udp" {
+		t.Fatalf("udp 频道模式错误: %q", c2.Mode)
 	}
 	if got := s.GetName("239.254.96.96:8550"); got != "CCTV-1" {
 		t.Fatalf("GetName = %q", got)
@@ -113,17 +119,24 @@ func TestAddUpdateDelete(t *testing.T) {
 func TestGenerateM3U(t *testing.T) {
 	s := openTemp(t)
 	s.ImportM3U(sampleM3U)
-	out := s.GenerateM3U("192.168.1.1:18888")
+	out := s.GenerateM3U("192.168.1.1:18888", "", nil)
 
 	for _, want := range []string{
 		"#EXTM3U",
 		"http://192.168.1.1:18888/rtp/239.254.96.96:8550",
-		"http://192.168.1.1:18888/rtp/239.69.1.123:10376", // udp 导入的频道导出统一走 /rtp/
+		"http://192.168.1.1:18888/udp/239.69.1.123:10376", // 导入时保留输入模式
 		`group-title="央视"`,
 		`tvg-logo="http://example.com/1.png"`,
+		`tvg-id="cctv1"`, // 保留 m3u 中的 tvg-id
 	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("m3u 输出缺少 %q:\n%s", want, out)
 		}
+	}
+
+	// 启用节目单导出时头部自动填充 url-tvg
+	out2 := s.GenerateM3U("192.168.1.1:18888", "http://192.168.1.1:18888/epg.xml", nil)
+	if !strings.Contains(out2, `#EXTM3U url-tvg="http://192.168.1.1:18888/epg.xml" x-tvg-url="http://192.168.1.1:18888/epg.xml"`) {
+		t.Fatalf("url-tvg 头缺失:\n%s", out2)
 	}
 }

@@ -15,6 +15,7 @@ RUN apt-get update && \
         kmod \
         procps \
         tzdata \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY iptv-proxy /usr/local/bin/iptv-proxy

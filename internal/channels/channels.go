@@ -12,10 +12,11 @@ import (
 	"iptv-udpproxy/internal/storeutil"
 )
 
-// m3uReAddr 从 /rtp/<addr:port> 或 /udp/<addr:port> 中提取组播地址。
-var m3uReAddr = regexp.MustCompile(`(?:rtp|udp)/(\d+\.\d+\.\d+\.\d+:\d+)`)
+// m3uReAddr 从 /rtp/<addr:port> 或 /udp/<addr:port> 中提取组播地址与输入模式。
+var m3uReAddr = regexp.MustCompile(`((rtp|udp))/(\d+\.\d+\.\d+\.\d+:\d+)`)
 
 var (
+	reTVGID   = regexp.MustCompile(`tvg-id="([^"]*)"`)
 	reTVGName = regexp.MustCompile(`tvg-name="([^"]*)"`)
 	reTVGroup = regexp.MustCompile(`group-title="([^"]*)"`)
 	reTVLogo  = regexp.MustCompile(`tvg-logo="([^"]*)"`)
@@ -27,7 +28,9 @@ type Channel struct {
 	Name    string `json:"name"`
 	Address string `json:"address"` // 组播地址，如 239.254.96.96:8550
 	Logo    string `json:"logo,omitempty"`
-	Group   string `json:"group,omitempty"` // 分组，如 央视、卫视
+	Group   string `json:"group,omitempty"`  // 分组，如 央视、卫视
+	EPGID   string `json:"epg_id,omitempty"` // 节目单频道 ID（xmltv channel id）
+	Mode    string `json:"mode,omitempty"`   // rtp|udp，m3u URL 前缀；空 = rtp
 }
 
 // Store 频道存储。
@@ -194,7 +197,7 @@ func (s *Store) ImportM3U(content string) int {
 // parseM3U 纯函数：解析 m3u 内容为频道列表（不修改存储、不持锁）。
 func parseM3U(content string) []Channel {
 	var out []Channel
-	var curName, curGroup, curLogo string
+	var curName, curGroup, curLogo, curID string
 
 	scanner := bufio.NewScanner(strings.NewReader(content))
 	scanner.Buffer(make([]byte, 0, 64*1024), 2*1024*1024) // 容忍超长行（如 base64 logo）
@@ -203,7 +206,10 @@ func parseM3U(content string) []Channel {
 		line := strings.TrimSpace(scanner.Text())
 
 		if strings.HasPrefix(line, "#EXTINF:") {
-			curName, curGroup, curLogo = "", "", ""
+			curName, curGroup, curLogo, curID = "", "", "", ""
+			if m := reTVGID.FindStringSubmatch(line); m != nil {
+				curID = m[1]
+			}
 			if m := reTVGName.FindStringSubmatch(line); m != nil {
 				curName = m[1]
 			}
@@ -226,8 +232,8 @@ func parseM3U(content string) []Channel {
 			continue
 		}
 
-		// URL 行：提取组播地址
-		address := extractMulticastAddr(line)
+		// URL 行：提取组播地址与输入模式
+		address, mode := extractMulticastAddr(line)
 		if address == "" || curName == "" {
 			curName = ""
 			continue
@@ -237,27 +243,40 @@ func parseM3U(content string) []Channel {
 			Address: address,
 			Logo:    curLogo,
 			Group:   curGroup,
+			EPGID:   curID,
+			Mode:    mode,
 		})
 		curName = ""
 	}
 	return out
 }
 
-// extractMulticastAddr 从 URL 中提取组播地址（支持 /rtp/ 与 /udp/ 前缀）。
-func extractMulticastAddr(url string) string {
+// extractMulticastAddr 从 URL 中提取组播地址与输入模式（支持 /rtp/ 与 /udp/ 前缀）。
+func extractMulticastAddr(url string) (string, string) {
 	if m := m3uReAddr.FindStringSubmatch(url); m != nil {
-		return m[1]
+		mode := m[2]
+		if mode == "" {
+			mode = "rtp"
+		}
+		return m[3], mode
 	}
-	return ""
+	return "", ""
 }
 
 // GenerateM3U 生成 m3u 格式内容。
-func (s *Store) GenerateM3U(host string) string {
+// tvgURL 非空时，头部自动填充 url-tvg/x-tvg-url（指向本服务的 /epg.xml）。
+// resolveEPGID 非 nil 时 tvg-id 优先填解析出的节目单真实频道 ID
+// （手工绑定 > 显式 tvg-id > 名称匹配），无匹配时保持原行为。
+func (s *Store) GenerateM3U(host, tvgURL string, resolveEPGID func(explicitID, name, address string) string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	var sb strings.Builder
-	sb.WriteString("#EXTM3U\n")
+	if tvgURL != "" {
+		sb.WriteString(fmt.Sprintf("#EXTM3U url-tvg=%q x-tvg-url=%q\n", tvgURL, tvgURL))
+	} else {
+		sb.WriteString("#EXTM3U\n")
+	}
 
 	// 按分组排序
 	groups := make(map[string][]*Channel)
@@ -281,12 +300,25 @@ func (s *Store) GenerateM3U(host string) string {
 			return channels[i].Name < channels[j].Name
 		})
 		for _, ch := range channels {
-			url := fmt.Sprintf("http://%s/rtp/%s", host, ch.Address)
+			mode := ch.Mode
+			if mode == "" {
+				mode = "rtp"
+			}
+			url := fmt.Sprintf("http://%s/%s/%s", host, mode, ch.Address)
 			logo := ""
 			if ch.Logo != "" {
 				logo = fmt.Sprintf(` tvg-logo="%s"`, ch.Logo)
 			}
-			sb.WriteString(fmt.Sprintf(`#EXTINF:-1 tvg-id="%d" tvg-name="%s"%s group-title="%s", %s`, id, ch.Name, logo, group, ch.Name))
+			tvgID := ch.EPGID
+			if resolveEPGID != nil {
+				if rid := resolveEPGID(ch.EPGID, ch.Name, ch.Address); rid != "" {
+					tvgID = rid
+				}
+			}
+			if tvgID == "" {
+				tvgID = fmt.Sprintf("%d", id)
+			}
+			sb.WriteString(fmt.Sprintf(`#EXTINF:-1 tvg-id="%s" tvg-name="%s"%s group-title="%s", %s`, tvgID, ch.Name, logo, group, ch.Name))
 			sb.WriteString("\n")
 			sb.WriteString(url)
 			sb.WriteString("\n")

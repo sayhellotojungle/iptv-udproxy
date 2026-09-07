@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"iptv-udpproxy/internal/channels"
+	"iptv-udpproxy/internal/epg"
 	"iptv-udpproxy/internal/limits"
 	"iptv-udpproxy/internal/pppoe"
+	"iptv-udpproxy/internal/record"
 	"iptv-udpproxy/internal/relay"
 	"iptv-udpproxy/internal/rules"
 	"iptv-udpproxy/internal/settings"
@@ -29,11 +31,13 @@ type Handler struct {
 	settings *settings.Store
 	stats    *stats.Store
 	limits   *limits.Store
+	epg      *epg.Manager
+	rec      *record.Manager
 	version  string
 }
 
 // New 创建 Handler。
-func New(relay *relay.Manager, pppoeMgr *pppoe.Manager, ruleStore *rules.Store, channelStore *channels.Store, settingsStore *settings.Store, statsStore *stats.Store, limitsStore *limits.Store, version string) *Handler {
+func New(relay *relay.Manager, pppoeMgr *pppoe.Manager, ruleStore *rules.Store, channelStore *channels.Store, settingsStore *settings.Store, statsStore *stats.Store, limitsStore *limits.Store, epgMgr *epg.Manager, recMgr *record.Manager, version string) *Handler {
 	return &Handler{
 		relay:    relay,
 		pppoe:    pppoeMgr,
@@ -42,6 +46,8 @@ func New(relay *relay.Manager, pppoeMgr *pppoe.Manager, ruleStore *rules.Store, 
 		settings: settingsStore,
 		stats:    statsStore,
 		limits:   limitsStore,
+		epg:      epgMgr,
+		rec:      recMgr,
 		version:  version,
 	}
 }
@@ -74,6 +80,33 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	sub.HandleFunc("/api/limits/", h.handleLimitByID)
 	sub.HandleFunc("/api/limits/pool", h.handlePool)
 
+	// EPG 节目单
+	sub.HandleFunc("/api/epg", h.handleEPGConfig)
+	sub.HandleFunc("/api/epg/refresh", h.handleEPGRefresh)
+	sub.HandleFunc("/api/epg/channels", h.handleEPGChannels)
+	sub.HandleFunc("/api/epg/programs", h.handleEPGPrograms)
+	sub.HandleFunc("/api/epg/search", h.handleEPGSearch)
+	sub.HandleFunc("/api/epg/binding", h.handleEPGBinding)
+	sub.HandleFunc("/epg.xml", h.handleEPGXML)
+	sub.HandleFunc("/epg", h.handleEPGPage)
+
+	// 录制
+	sub.HandleFunc("/api/record/plans", h.handleRecordPlans)
+	sub.HandleFunc("/api/record/plans/", h.handleRecordPlanByID)
+	sub.HandleFunc("/api/record/active", h.handleRecordActive)
+	sub.HandleFunc("/api/record/history", h.handleRecordHistory)
+	sub.HandleFunc("/api/record/history/", h.handleRecordHistory)
+	sub.HandleFunc("/api/record/ai", h.handleRecordAI)
+	sub.HandleFunc("/api/record/ai/generate", h.handleRecordAIGenerate)
+	sub.HandleFunc("/api/record/epg", h.handleRecordFromEPG)
+	sub.HandleFunc("/api/record/epg/series", h.handleRecordEPGSeries)
+	sub.HandleFunc("/api/record/manual", h.handleRecordManual)
+	sub.HandleFunc("/api/record/settings", h.handleRecordSettings)
+	sub.HandleFunc("/api/record/disk", h.handleRecordDisk)
+	sub.HandleFunc("/api/record/file", h.handleRecordFile)
+	sub.HandleFunc("/api/record/preview", h.handleRecordPreview)
+	sub.HandleFunc("/record", h.handleRecordPage)
+
 	// Web 控制台
 	sub.HandleFunc("/", h.handleIndex)
 	sub.HandleFunc("/settings", h.handleSettingsPage)
@@ -88,7 +121,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 			log.Printf("[http] %s %s -> %d (%s)", r.Method, r.URL.Path, lw.code, time.Since(start).Round(time.Millisecond))
 			return
 		}
-		if r.URL.Path == "/" || strings.HasPrefix(r.URL.Path, "/rtp/") || strings.HasPrefix(r.URL.Path, "/udp/") {
+		if r.URL.Path == "/" || strings.HasPrefix(r.URL.Path, "/rtp/") || strings.HasPrefix(r.URL.Path, "/udp/") || r.URL.Path == "/epg.xml" {
 			log.Printf("[http] %s %s", r.Method, r.URL.Path)
 		}
 		sub.ServeHTTP(w, r)
@@ -326,7 +359,7 @@ func (h *Handler) handleChannelsImport(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"status": "ok", "imported": count})
 }
 
-// GET /api/m3u 生成 m3u 文件。
+// GET /api/m3u 生成 m3u 文件。节目单启用时头部自动填充 url-tvg（指向 /epg.xml）。
 func (h *Handler) handleM3U(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, 405, "Method Not Allowed")
@@ -338,10 +371,27 @@ func (h *Handler) handleM3U(w http.ResponseWriter, r *http.Request) {
 		host = "localhost:18888"
 	}
 
-	content := h.channels.GenerateM3U(host)
+	tvgURL := ""
+	var resolveEPGID func(string, string, string) string
+	if h.epg != nil {
+		st := h.epg.Status()
+		if st.Enabled && st.M3UTvg && h.epg.HasCache() {
+			tvgURL = epg.ExportURL(host)
+		}
+		if h.epg.HasCache() {
+			// tvg-id 填解析出的节目单真实频道 ID（手工绑定 > 显式 tvg-id > 名称匹配）
+			resolveEPGID = func(explicitID, name, address string) string {
+				if id, ok := h.epg.ResolveIDFor(explicitID, name, address); ok {
+					return id
+				}
+				return ""
+			}
+		}
+	}
+	content := h.channels.GenerateM3U(host, tvgURL, resolveEPGID)
 	w.Header().Set("Content-Type", "audio/x-mpegurl; charset=utf-8")
 	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="iptv.m3u"`))
-	w.Write([]byte(content))
+	_, _ = w.Write([]byte(content))
 }
 
 // GET/PUT /api/settings 获取/更新配置。
@@ -621,6 +671,8 @@ select{min-width:200px}
 <div class="container">
 <div class="nav">
 <a href="/" class="active">控制台</a>
+<a href="/epg">节目单</a>
+<a href="/record">录制</a>
 <a href="/settings">设置</a>
 </div>
 
@@ -672,8 +724,24 @@ select{min-width:200px}
 <label>频道</label><select id="limit-channel" name="channel" required><option value="">选择频道...</option></select>
 <label>每日上限(秒)</label><input name="daily_max" type="number" value="0" min="0" style="width:80px">
 <label>每周上限(秒)</label><input name="weekly_max" type="number" value="0" min="0" style="width:80px">
+<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:flex-end;padding:8px 10px;background:#0f172a;border-radius:8px">
+<label style="padding-bottom:6px">周几上限(秒, 设置后覆盖每日)</label>
+<label style="display:flex;flex-direction:column;gap:2px;font-size:.8rem">一<input name="wd_1" type="number" value="0" min="0" style="width:70px"></label>
+<label style="display:flex;flex-direction:column;gap:2px;font-size:.8rem">二<input name="wd_2" type="number" value="0" min="0" style="width:70px"></label>
+<label style="display:flex;flex-direction:column;gap:2px;font-size:.8rem">三<input name="wd_3" type="number" value="0" min="0" style="width:70px"></label>
+<label style="display:flex;flex-direction:column;gap:2px;font-size:.8rem">四<input name="wd_4" type="number" value="0" min="0" style="width:70px"></label>
+<label style="display:flex;flex-direction:column;gap:2px;font-size:.8rem">五<input name="wd_5" type="number" value="0" min="0" style="width:70px"></label>
+<label style="display:flex;flex-direction:column;gap:2px;font-size:.8rem">六<input name="wd_6" type="number" value="0" min="0" style="width:70px"></label>
+<label style="display:flex;flex-direction:column;gap:2px;font-size:.8rem">日<input name="wd_0" type="number" value="0" min="0" style="width:70px"></label>
+</div>
+<div style="flex-basis:100%;height:0"></div>
+<label style="display:flex;align-items:center;gap:6px" title="连续观看超过最大连续观看时长后切换到备选池；须间隔休息时长未再观看该频道才能调回。两次观看间隔不超过休息时长视为连续。">
+<input type="checkbox" name="continuous_enabled"> 启用连续限制</label>
+<label>最大连续观看(秒)</label><input name="continuous_max" type="number" value="0" min="0" style="width:90px">
+<label>休息时长(秒)</label><input name="rest_duration" type="number" value="0" min="0" style="width:90px">
+<div style="flex-basis:100%;height:0"></div>
 <button type="submit" class="success">保存</button>
-<button type="button" onclick="document.getElementById('limit-form-area').style.display='none'" style="background:#475569">取消</button>
+<button type="button" onclick="closeLimitForm()" style="background:#475569">取消</button>
 </form>
 </div>
 <h2 style="margin-top:20px">备选地址池</h2>
@@ -1127,9 +1195,54 @@ function updateLimitChannelSelect() {
   });
 }
 
+let editingLimit = null; // 编辑中的原规则（回带 enabled，避免整对象替换时丢失）
+
 function showAddLimit() {
+  editingLimit = null;
+  document.getElementById('limit-form').reset();
   updateLimitChannelSelect();
   document.getElementById('limit-form-area').style.display = 'block';
+}
+
+function editLimit(id) {
+  fetch('/api/limits/' + id)
+    .then(r => { if (!r.ok) throw new Error('获取失败'); return r.json(); })
+    .then(lim => {
+      editingLimit = lim;
+      document.getElementById('limit-form').reset();
+      updateLimitChannelSelect();
+      const sel = document.getElementById('limit-channel');
+      if (![...sel.options].some(o => o.value === lim.address)) {
+        sel.add(new Option(lim.address, lim.address));
+      }
+      sel.value = lim.address;
+      const f = document.getElementById('limit-form');
+      f.daily_max.value = lim.daily_max || 0;
+      f.weekly_max.value = lim.weekly_max || 0;
+      const wd = lim.weekday_max || [0, 0, 0, 0, 0, 0, 0];
+      for (let d = 0; d <= 6; d++) f['wd_' + d].value = wd[d] || 0;
+      f.continuous_max.value = lim.continuous_max || 0;
+      f.rest_duration.value = lim.rest_duration || 0;
+      f.continuous_enabled.checked = !!lim.continuous_enabled;
+      document.getElementById('limit-form-area').style.display = 'block';
+    })
+    .catch(e => toast('打开编辑失败: ' + e.message, false));
+}
+
+function closeLimitForm() {
+  editingLimit = null;
+  document.getElementById('limit-form').reset();
+  document.getElementById('limit-form-area').style.display = 'none';
+}
+
+function formatWeekdayLimits(wd) {
+  if (!wd) return '-';
+  const names = ['日', '一', '二', '三', '四', '五', '六'];
+  const parts = [];
+  [1, 2, 3, 4, 5, 6, 0].forEach(i => {
+    if (wd[i] > 0) parts.push(names[i] + ' ' + formatDuration(wd[i]));
+  });
+  return parts.length ? parts.join('，') : '-';
 }
 
 function loadLimits() {
@@ -1139,15 +1252,18 @@ function loadLimits() {
       d.innerHTML = '<div class="empty">暂无限制规则</div>';
       return;
     }
-    let h = '<table><tr><th>频道</th><th>每日上限</th><th>每周上限</th><th>状态</th><th>操作</th></tr>';
+    let h = '<table><tr><th>频道</th><th>每日上限</th><th>周几上限</th><th>每周上限</th><th>连续限制</th><th>状态</th><th>操作</th></tr>';
     list.forEach(lim => {
       const name = channelName(lim.address) || lim.address;
       const daily = lim.daily_max > 0 ? formatDuration(lim.daily_max) : '-';
+      const weekday = formatWeekdayLimits(lim.weekday_max);
       const weekly = lim.weekly_max > 0 ? formatDuration(lim.weekly_max) : '-';
+      const cont = lim.continuous_enabled ? formatDuration(lim.continuous_max) + ' / 休息' + formatDuration(lim.rest_duration) : '-';
       const st = lim.enabled ? '<span class="badge badge-up">启用</span>' : '<span class="badge badge-idle">禁用</span>';
       h += '<tr><td><span class="channel-name">' + esc(name) + '</span><br><small>' + esc(lim.address) + '</small></td>';
-      h += '<td>' + daily + '</td><td>' + weekly + '</td><td>' + st + '</td>';
-      h += '<td><button class="sm" onclick="toggleLimit(\'' + esc(lim.id) + '\',' + !lim.enabled + ')">' + (lim.enabled ? '禁用' : '启用') + '</button> ';
+      h += '<td>' + daily + '</td><td>' + weekday + '</td><td>' + weekly + '</td><td>' + cont + '</td><td>' + st + '</td>';
+      h += '<td><button class="sm" onclick="editLimit(\'' + esc(lim.id) + '\')">编辑</button> ';
+      h += '<button class="sm" onclick="toggleLimit(\'' + esc(lim.id) + '\',' + !lim.enabled + ')">' + (lim.enabled ? '禁用' : '启用') + '</button> ';
       h += '<button class="sm danger" onclick="delLimit(\'' + esc(lim.id) + '\')">删除</button></td></tr>';
     });
     h += '</table>';
@@ -1160,14 +1276,26 @@ function addLimit(e) {
   const f = e.target;
   const address = f.channel.value;
   if (!address) { toast('请选择频道', false); return false; }
+  const weekday_max = [0, 0, 0, 0, 0, 0, 0];
+  for (let d = 0; d <= 6; d++) {
+    weekday_max[d] = parseInt(f['wd_' + d].value) || 0;
+  }
   const body = {
     address: address,
     daily_max: parseInt(f.daily_max.value) || 0,
     weekly_max: parseInt(f.weekly_max.value) || 0,
-    enabled: true
+    weekday_max: weekday_max,
+    continuous_max: parseInt(f.continuous_max.value) || 0,
+    rest_duration: parseInt(f.rest_duration.value) || 0,
+    continuous_enabled: !!f.continuous_enabled.checked,
+    enabled: editingLimit ? !!editingLimit.enabled : true
   };
-  fetch('/api/limits', {
-    method: 'POST',
+  // 编辑按 ID 回传（PUT），新增走 POST
+  const url = editingLimit ? '/api/limits/' + editingLimit.id : '/api/limits';
+  const method = editingLimit ? 'PUT' : 'POST';
+  const isEdit = !!editingLimit;
+  fetch(url, {
+    method: method,
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(body)
   })
@@ -1176,7 +1304,8 @@ function addLimit(e) {
       return r.json();
     })
     .then(() => {
-      toast('限制规则已添加', true);
+      toast(isEdit ? '限制规则已更新' : '限制规则已添加', true);
+      editingLimit = null;
       f.reset();
       document.getElementById('limit-form-area').style.display = 'none';
       loadLimits();
@@ -1292,6 +1421,8 @@ button.success:hover{background:#047857}
 <div class="container">
 <div class="nav">
 <a href="/">控制台</a>
+<a href="/epg">节目单</a>
+<a href="/record">录制</a>
 <a href="/settings" class="active">设置</a>
 </div>
 

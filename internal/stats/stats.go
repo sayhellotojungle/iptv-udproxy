@@ -142,6 +142,31 @@ func (s *Store) Add(address string, duration time.Duration, t time.Time) {
 	s.mu.Unlock()
 }
 
+// AddRange 把 [start, end] 的观看时长按自然日分段聚合：跨天流计入各天实际停留的秒数。
+// 不立即落盘。
+func (s *Store) AddRange(address string, start, end time.Time) {
+	if address == "" || !end.After(start) {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for cur := start; cur.Before(end); {
+		segEnd := time.Date(cur.Year(), cur.Month(), cur.Day(), 0, 0, 0, 0, cur.Location()).AddDate(0, 0, 1)
+		if end.Before(segEnd) {
+			segEnd = end
+		}
+		if sec := int64(segEnd.Sub(cur).Seconds()); sec > 0 {
+			byDate, ok := s.aggr[address]
+			if !ok {
+				byDate = make(map[string]int64)
+				s.aggr[address] = byDate
+			}
+			byDate[cur.Format("2006-01-02")] += sec
+		}
+		cur = segEnd
+	}
+}
+
 // Flush 立即落盘（并顺带裁剪过期数据）。
 func (s *Store) Flush() error {
 	s.mu.Lock()

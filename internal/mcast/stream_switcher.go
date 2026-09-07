@@ -870,7 +870,7 @@ func rewritePCR(packet []byte, offset int64) {
 	field[2] = byte(base >> 9)
 	field[3] = byte((base>>2)&0x7f)<<1 | 1
 	field[4] = byte((base>>1)&0x03) << 6 // base 1..0 + PCR_ext=0
-	field[5] = 0xff // 保留位 11111111
+	field[5] = 0xff                      // 保留位 11111111
 }
 
 func buildPATPacket(program, pmtPID uint16, version byte) []byte {

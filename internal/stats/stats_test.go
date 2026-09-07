@@ -201,6 +201,33 @@ func TestAddGuards(t *testing.T) {
 	}
 }
 
+// AddRange 跨天流按自然日分段归属；同日/非法区间与 Add 等价或忽略。
+func TestAddRangeCrossDay(t *testing.T) {
+	s := openTemp(t)
+	start := time.Date(2026, 7, 20, 23, 0, 0, 0, time.Local)
+	end := time.Date(2026, 7, 21, 1, 30, 0, 0, time.Local)
+	s.AddRange("a:1", start, end)
+	if got := s.HistoricalSum("a:1", "2026-07-20"); got != 3600 {
+		t.Fatalf("周一应计 1h, got %d", got)
+	}
+	if got := s.HistoricalSum("a:1", "2026-07-21"); got != 5400 {
+		t.Fatalf("周二应计 1h30m, got %d", got)
+	}
+
+	// 同日区间等价于整段
+	s.AddRange("b:2", time.Date(2026, 7, 20, 10, 0, 0, 0, time.Local), time.Date(2026, 7, 20, 11, 0, 0, 0, time.Local))
+	if got := s.HistoricalSum("b:2", "2026-07-20"); got != 3600 {
+		t.Fatalf("同日应计 1h, got %d", got)
+	}
+
+	// 空地址 / end<=start 忽略
+	s.AddRange("", start, end)
+	s.AddRange("c:3", end, start)
+	if n := len(s.aggr); n != 2 {
+		t.Fatalf("非法入参不应聚合: %v", s.aggr)
+	}
+}
+
 func mondayOf(now time.Time) time.Time {
 	m := now
 	for m.Weekday() != time.Monday {

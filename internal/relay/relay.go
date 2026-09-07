@@ -196,6 +196,70 @@ func (m *Manager) LimitBlocked() []string {
 	return out
 }
 
+// RecSource 录制等内部消费者使用的组播数据源。
+type RecSource struct {
+	Packets <-chan mcast.Packet
+	Release func()
+	ErrCh   <-chan error // 订阅溢出（MPEG-TS 静默丢包）时收到 ErrSubscriberOverflow
+}
+
+// AcquireSource 为非 HTTP 消费者（录制）打开一个组播源。
+// 与观看流共享同一 refcount reader（避免同地址二次绑组播端口），
+// 同样应用换源规则；rtp 仅表示期望的输入封装，实际解码由消费方完成。
+func (m *Manager) AcquireSource(addr string, rtp bool) (RecSource, error) {
+	// 按需拨号：与观看流一致。否则线路未拨时录制开了组播组却收不到包，只落 0 字节文件
+	if m.pppoe != nil && m.pppoe.IsEnabled() && !m.pppoe.IsUp() {
+		log.Printf("[relay] 录制: PPPoE 未启动，尝试自动拨号...")
+		if err := m.pppoe.Start(); err != nil {
+			log.Printf("[relay] 录制: PPPoE 自动拨号失败: %v（录制继续，可在网页重试）", err)
+		}
+	}
+
+	// 录制跟随换源规则：若规则把 A 换成 B，录到的就是 B 的内容
+	real := m.rules.Resolve(addr, time.Now())
+	group, port := splitAddr(real)
+
+	entry, err := m.getOrCreateReader(group, port)
+	if err != nil {
+		return RecSource{}, err
+	}
+	ch := make(chan mcast.Packet, 2048)
+	unsub, subErr := entry.reader.Subscribe(ch)
+	if m.pppoe != nil {
+		m.pppoe.NotifyActivity()
+	}
+	return RecSource{
+		Packets: ch,
+		ErrCh:   subErr,
+		Release: func() {
+			unsub()
+			m.releaseReader(group, port, entry)
+			// 已无任何消费者（观看流或录制订阅）时启动空闲断线计时
+			if m.pppoe != nil {
+				if idle, to := m.idleIfConsumersGone(); idle {
+					m.pppoe.NotifyIdle(to)
+				}
+			}
+		},
+	}, nil
+}
+
+// idleIfConsumersGone 当前是否已无任何流消费者（无活跃观看流，
+// 且所有 reader 均无订阅者）；是则返回空闲超时。
+func (m *Manager) idleIfConsumersGone() (bool, time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.streams) > 0 {
+		return false, 0
+	}
+	for _, e := range m.readers {
+		if e.reader.SubCount() > 0 {
+			return false, 0
+		}
+	}
+	return true, m.idleTimeout
+}
+
 // StartCleanup 启动后台清理协程：每 30 秒回收一次无订阅者的空 reader。
 // 注意：慢订阅/幽灵订阅由 reader 在广播溢出时即时移除（见 mcast.Reader.broadcast），
 // 这里不再做延迟清理。ctx 取消时退出。
@@ -281,12 +345,12 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if result := m.limits.CheckLimit(multicastAddr, m.stats, 0, time.Now()); result != nil {
 			if replacement, ok := m.limits.PickReplacement(currentRealAddr); ok {
 				log.Printf("[relay] 频道 %s 已达到%s限制 (%d/%d秒)，直接使用备选源 %s",
-					multicastAddr, result.LimitType, result.CurrentSec, result.MaxSec, replacement)
+					multicastAddr, result.LimitDesc(), result.CurrentSec, result.MaxSec, replacement)
 				currentRealAddr = replacement
 				limitOverrideAddr = replacement
 				m.setLimitBlocked(multicastAddr, false)
 			} else {
-				log.Printf("[relay] 频道 %s 已达到%s限制，但备选地址池为空，使用原源", multicastAddr, result.LimitType)
+				log.Printf("[relay] 频道 %s 已达到%s限制，但备选地址池为空，使用原源", multicastAddr, result.LimitDesc())
 				m.setLimitBlocked(multicastAddr, true)
 			}
 		} else {
@@ -347,10 +411,13 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		m.mu.Unlock()
 		log.Printf("[relay] 流结束 %s → %s, 发送 %d 字节", multicastAddr, currentRealAddr, info.BytesSent)
 
-		// 记录观看时长
+		// 记录观看时长（跨天流按自然日分段归属）
 		if m.stats != nil {
-			duration := time.Since(info.StartTime)
-			m.stats.Add(multicastAddr, duration, info.StartTime)
+			m.stats.AddRange(multicastAddr, info.StartTime, time.Now())
+		}
+		// 记录会话结束，供连续观看限制判定（间隔≤休息时长视为连续）
+		if m.limits != nil {
+			m.limits.EndSession(multicastAddr, info.StartTime, time.Now())
 		}
 
 		// 通知 PPPoE 流结束，如果没有其他活跃流则启动空闲计时器
@@ -668,7 +735,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					replacement, ok := m.limits.PickReplacement(currentRealAddr)
 					if ok {
 						log.Printf("[relay] 频道 %s 达到%s限制 (%d/%d秒)，切换到备选源 %s",
-							multicastAddr, result.LimitType, result.CurrentSec, result.MaxSec, replacement)
+							multicastAddr, result.LimitDesc(), result.CurrentSec, result.MaxSec, replacement)
 
 						limGroup, limPort := splitAddr(replacement)
 						limEntry, err := m.getOrCreateReader(limGroup, limPort)
@@ -695,7 +762,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 							m.setLimitBlocked(multicastAddr, false)
 						}
 					} else {
-						log.Printf("[relay] 频道 %s 达到%s限制，但备选地址池为空，无法切换", multicastAddr, result.LimitType)
+						log.Printf("[relay] 频道 %s 达到%s限制，但备选地址池为空，无法切换", multicastAddr, result.LimitDesc())
 						m.setLimitBlocked(multicastAddr, true)
 					}
 				} else {

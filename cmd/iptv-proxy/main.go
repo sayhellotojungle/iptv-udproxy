@@ -12,8 +12,10 @@ import (
 	"iptv-udpproxy/internal/api"
 	"iptv-udpproxy/internal/channels"
 	"iptv-udpproxy/internal/config"
+	"iptv-udpproxy/internal/epg"
 	"iptv-udpproxy/internal/limits"
 	"iptv-udpproxy/internal/pppoe"
+	"iptv-udpproxy/internal/record"
 	"iptv-udpproxy/internal/relay"
 	"iptv-udpproxy/internal/routeguard"
 	"iptv-udpproxy/internal/rules"
@@ -77,6 +79,27 @@ func main() {
 	}
 	log.Printf("  已加载 %d 条限制规则", len(limitsStore.ListLimits()))
 
+	// 初始化节目单（EPG）管理器
+	epgMgr, err := epg.New(cfg.DataDir+"/epg_config.json", cfg.DataDir+"/epg_cache.json")
+	if err != nil {
+		log.Fatalf("加载节目单配置失败: %v", err)
+	}
+	if st := epgMgr.Status(); st.Enabled {
+		log.Printf("  节目单: 来源 %s, 周期 %d 小时, 缓存 %d 频道/%d 节目",
+			st.Source, st.IntervalHours, st.Channels, st.Programs)
+	}
+
+	// 初始化录制管理器（计划、AI 配置、历史均持久化在 /data 下）
+	recPlanStore, err := record.Open(cfg.DataDir + "/recplans.json")
+	if err != nil {
+		log.Fatalf("加载录制计划文件失败: %v", err)
+	}
+	recMgr := record.NewManager(recPlanStore, cfg.DataDir+"/recordings", channelStore, epgMgr, record.Options{
+		HistoryPath: cfg.DataDir + "/recordings.json",
+		AIPath:      cfg.DataDir + "/ai.json",
+	})
+	log.Printf("  已加载 %d 条录制计划", len(recPlanStore.List()))
+
 	// 初始化 PPPoE
 	pppoeCfg := pppoe.Config{
 		Iface: appSettings.PPPoEIface,
@@ -122,8 +145,16 @@ func main() {
 	relayMgr.SetLimits(limitsStore)
 	relayMgr.SetIdleTimeout(time.Duration(appSettings.IdleTimeout) * time.Second)
 
+	// 录制使用 relay 的 refcount reader（与观看流共享组播组，避免重复绑端口）
+	recMgr.SetSource(relayMgr)
+
 	// 统计存储：30 秒定时落盘，ctx 结束即停（末次落盘由 Close 完成）
 	statsStore.Start(ctx)
+
+	// 节目单定时拉取 + 录制调度循环
+	epgMgr.Start(ctx)
+	recMgr.Start(ctx)
+	defer recMgr.StopAll() // 优雅退出：停止录制会话并落盘
 
 	// 启动幽灵订阅清除（使用全局 context，关闭信号时自动退出）
 	relayMgr.StartCleanup(ctx)
@@ -154,7 +185,7 @@ func main() {
 	})
 
 	// 注册 HTTP 路由
-	handler := api.New(relayMgr, pppoeMgr, ruleStore, channelStore, settingsStore, statsStore, limitsStore, version)
+	handler := api.New(relayMgr, pppoeMgr, ruleStore, channelStore, settingsStore, statsStore, limitsStore, epgMgr, recMgr, version)
 	mux := http.NewServeMux()
 	handler.RegisterRoutes(mux)
 
