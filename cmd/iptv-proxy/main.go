@@ -23,7 +23,7 @@ import (
 	"iptv-udpproxy/internal/stats"
 )
 
-var version = "1.2"
+var version = "1.3"
 
 // fallbackMcastIface 未配置组播网口时的兜底值（应通过 Web 界面配置，非通用默认）。
 const fallbackMcastIface = "enp2s0-ovs"
