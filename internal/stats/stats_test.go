@@ -1,8 +1,10 @@
 package stats
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
@@ -234,4 +236,50 @@ func mondayOf(now time.Time) time.Time {
 		m = m.AddDate(0, 0, -1)
 	}
 	return m
+}
+
+// TestConcurrentQueryAndAdd 回归：Query 遍历聚合表期间并发 Add/AddRange/Flush。
+// Query 若不持 mu 遍历，会触发 fatal "concurrent map iteration and map write"
+// ——fatal 不可 recover，整个进程崩溃，故必须在 -race 下覆盖。
+func TestConcurrentQueryAndAdd(t *testing.T) {
+	s := openTemp(t)
+	stop := time.Now().Add(400 * time.Millisecond)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			for k := 0; time.Now().Before(stop); k++ {
+				addr := fmt.Sprintf("239.1.1.%d:%d", n, 1000+k%5)
+				now := time.Now()
+				s.Add(addr, time.Second, now)
+				s.AddRange(addr, now.Add(-2*time.Hour), now)
+			}
+		}(i)
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for time.Now().Before(stop) {
+				s.Query("day", "", 10, func(a string) string { return a })
+				s.Query("week", "", 0, nil)
+				s.Query("month", "", 0, nil)
+			}
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for time.Now().Before(stop) {
+			if err := s.Flush(); err != nil {
+				t.Errorf("Flush: %v", err)
+				return
+			}
+		}
+	}()
+	wg.Wait()
+	if len(s.Query("day", "", 0, nil).Channels) == 0 {
+		t.Fatal("并发写入后应有统计结果")
+	}
 }

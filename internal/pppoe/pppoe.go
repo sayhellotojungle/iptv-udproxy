@@ -54,10 +54,13 @@ type Manager struct {
 	startAt    time.Time
 	stopCh     chan struct{}  // 用于通知 waitLoop 退出
 	stopped    bool           // 标记是否主动停止
+	terminated bool           // 终态：进程退出时置位，禁止任何再次启动（含自动重连）
+	epoch      uint64         // 每次 Stop 递增，用于作废已排期的自动重连
 	onDemand   bool           // 按需拨号模式
 	enabled    bool           // PPPoE 是否启用
 	idleTimer  *time.Timer    // 空闲断开定时器
 	waitWg     sync.WaitGroup // 跟踪 waitLoop goroutine
+	reconnWg   sync.WaitGroup // 跟踪重连 goroutine（仅 Shutdown 等待，Stop 不等以免自等）
 	generation uint64         // 每次 Start 递增，防止旧 waitLoop 覆盖状态
 
 	autoReconnect   bool          // pppd 意外退出后自动重连
@@ -107,6 +110,10 @@ func (m *Manager) Status() Status {
 // 只会拉起一个 pppd。
 func (m *Manager) Start() error {
 	m.mu.Lock()
+	if m.terminated {
+		m.mu.Unlock()
+		return fmt.Errorf("PPPoE 管理器已终止，不再拨号")
+	}
 	if m.cmd != nil || m.starting {
 		m.mu.Unlock()
 		return fmt.Errorf("拨号进程已在运行或启动中")
@@ -167,9 +174,16 @@ func (m *Manager) Start() error {
 	m.cmd = cmd
 	m.starting = false
 	m.startAt = time.Now()
+	// 新拨号已建立，作废残留的空闲断开定时器，避免陈旧定时器掐断刚连上的链路
+	if m.idleTimer != nil {
+		m.idleTimer.Stop()
+		m.idleTimer = nil
+	}
+	// Add 必须在锁内完成：若插在解锁与 Add 之间被 Stop() 切入，Stop 的 waitWg.Wait()
+	// 计数为 0 会立即返回，"已确认进程退出"的保证失效，Retry 可与旧 pppd 并发拨号。
+	m.waitWg.Add(1)
 	m.mu.Unlock()
 
-	m.waitWg.Add(1)
 	go m.waitLoop(cmd, gen)
 
 	// 等待 ppp 接口就绪
@@ -199,9 +213,14 @@ func (m *Manager) Stop() {
 		return
 	}
 	m.stopped = true
+	m.epoch++ // 作废已排期的自动重连
 	cmd := m.cmd
 	m.cmd = nil
 	m.status = Status{State: StateIdle, Unit: m.cfg.Unit}
+	if m.idleTimer != nil {
+		m.idleTimer.Stop()
+		m.idleTimer = nil
+	}
 	close(m.stopCh)
 	m.stopCh = make(chan struct{})
 	// 取消正在进行的重连
@@ -217,6 +236,33 @@ func (m *Manager) Stop() {
 
 	// 等待 waitLoop 确认进程已退出，确保 Stop() 返回后可以安全地重新 Start()
 	m.waitWg.Wait()
+}
+
+// Shutdown 终态停止：置终止标志后停止拨号，并等待自动重连 goroutine 退出。
+// 供进程退出路径调用——重连 goroutine 可能已越过 cancel 分支正在 Start()，
+// 普通 Stop() 追不上它，会在 Stop 之后重新拉起 pppd 成为孤儿进程占用链路。
+func (m *Manager) Shutdown() {
+	m.mu.Lock()
+	// terminated 与 scheduleReconnect 的 Add 同在锁内判定，
+	// 保证 Shutdown 开始 Wait 后不会再有新的 Add。
+	m.terminated = true
+	cancel := m.reconnectCancel
+	m.reconnectCancel = nil
+	m.mu.Unlock()
+	if cancel != nil {
+		close(cancel)
+	}
+	m.Stop()
+	done := make(chan struct{})
+	go func() {
+		m.reconnWg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		log.Printf("[pppoe] 等待自动重连 goroutine 超时，继续退出")
+	}
 }
 
 // Retry 重新拨号（先停止再启动）。
@@ -377,23 +423,36 @@ func (m *Manager) waitLoop(cmd *exec.Cmd, gen uint64) {
 // scheduleReconnect 安排自动重连，使用指数退避。
 func (m *Manager) scheduleReconnect() {
 	m.mu.Lock()
-	if m.stopped {
+	if m.stopped || m.terminated {
 		m.mu.Unlock()
 		return
 	}
 	cancel := make(chan struct{})
 	m.reconnectCancel = cancel
 	delay := m.reconnectDelay
+	epoch := m.epoch
+	m.reconnWg.Add(1)
 	m.mu.Unlock()
 
 	log.Printf("[pppoe] 将在 %s 后尝试自动重连", delay)
 
 	go func() {
+		defer m.reconnWg.Done()
 		select {
 		case <-time.After(delay):
 		case <-cancel:
 			return
 		}
+
+		// 排期期间可能已被 Stop：epoch 变化即作废。否则 Stop 返回后本 goroutine 仍会
+		// 调 Start（而 Start 会把 stopped 复位给下一次拨号用），从而拉起 Stop 追不上的 pppd。
+		m.mu.Lock()
+		if m.terminated || m.epoch != epoch {
+			m.mu.Unlock()
+			log.Printf("[pppoe] 重连排期已作废，跳过本次自动重连")
+			return
+		}
+		m.mu.Unlock()
 
 		log.Printf("[pppoe] 开始自动重连...")
 		if err := m.Start(); err != nil {

@@ -3,6 +3,7 @@ package relay
 import (
 	"encoding/binary"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -134,5 +135,71 @@ func TestUDPInputDecoderRequiresAlignedTS(t *testing.T) {
 	packet[0] = 0x47
 	if _, err := decoder.Decode(packet); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestGetOrCreateReaderConcurrentShared 并发请求同一组播地址必须共享同一个 reader。
+// 建 socket 移出全局锁后，由每地址一把创建锁 + 双检保证不重复建连。
+func TestGetOrCreateReaderConcurrentShared(t *testing.T) {
+	rs, err := rules.Open(filepath.Join(t.TempDir(), "rules.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New("lo", rs)
+	probe, err := m.getOrCreateReader("239.1.1.1", 10811)
+	if err != nil {
+		t.Skipf("当前环境无法创建组播 reader: %v", err)
+	}
+	const n = 16
+	entries := make([]*readerEntry, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(k int) {
+			defer wg.Done()
+			e, err := m.getOrCreateReader("239.1.1.1", 10811)
+			if err != nil {
+				t.Errorf("getOrCreateReader: %v", err)
+				return
+			}
+			entries[k] = e
+		}(i)
+	}
+	wg.Wait()
+	for _, e := range entries {
+		if e != probe {
+			t.Fatal("并发请求应共享同一个 reader")
+		}
+	}
+	m.mu.Lock()
+	ref, size := probe.refCnt, len(m.readers)
+	m.mu.Unlock()
+	if ref != n+1 || size != 1 {
+		t.Fatalf("refCnt=%d 期望 %d, readers=%d 期望 1", ref, n+1, size)
+	}
+	for i := 0; i < n; i++ {
+		m.releaseReader(probe)
+	}
+	m.releaseReader(probe)
+	m.mu.Lock()
+	size = len(m.readers)
+	m.mu.Unlock()
+	if size != 0 {
+		t.Fatalf("引用释放后应回收 reader, got %d", size)
+	}
+}
+
+// TestKeyLockIsolatedPerAddress 不同组播地址各自一把创建锁，互不阻塞。
+func TestKeyLockIsolatedPerAddress(t *testing.T) {
+	rs, err := rules.Open(filepath.Join(t.TempDir(), "rules.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := New("lo", rs)
+	if m.keyLock("239.1.1.1:10811") == m.keyLock("239.1.1.2:10811") {
+		t.Fatal("不同地址应各自一把锁")
+	}
+	if m.keyLock("239.1.1.1:10811") != m.keyLock("239.1.1.1:10811") {
+		t.Fatal("同一地址应复用同一把锁")
 	}
 }

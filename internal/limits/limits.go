@@ -73,6 +73,7 @@ type SessionState struct {
 // Store 限制规则存储，带 JSON 持久化。
 type Store struct {
 	mu       sync.Mutex
+	saveMu   sync.Mutex // 串行化落盘：快照与写盘同序，且写文件不持 mu
 	path     string
 	limits   []Limit
 	pool     PoolConfig
@@ -156,9 +157,9 @@ func (s *Store) AddLimit(l Limit) (Limit, error) {
 	l.ID = newID()
 	l.Enabled = true
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.limits = append(s.limits, l)
-	return l, s.save()
+	s.mu.Unlock()
+	return l, s.persist()
 }
 
 // UpdateLimit 按 ID 更新限制规则。
@@ -167,27 +168,29 @@ func (s *Store) UpdateLimit(id string, l Limit) (Limit, error) {
 		return Limit{}, err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for i := range s.limits {
 		if s.limits[i].ID == id {
 			l.ID = id
 			s.limits[i] = l
-			return l, s.save()
+			s.mu.Unlock()
+			return l, s.persist()
 		}
 	}
+	s.mu.Unlock()
 	return Limit{}, fmt.Errorf("限制规则 %s 不存在", id)
 }
 
 // DeleteLimit 按 ID 删除限制规则。
 func (s *Store) DeleteLimit(id string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for i := range s.limits {
 		if s.limits[i].ID == id {
 			s.limits = append(s.limits[:i], s.limits[i+1:]...)
-			return s.save()
+			s.mu.Unlock()
+			return s.persist()
 		}
 	}
+	s.mu.Unlock()
 	return fmt.Errorf("限制规则 %s 不存在", id)
 }
 
@@ -209,9 +212,13 @@ func (s *Store) SetPool(pool PoolConfig) error {
 		}
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.pool = pool
-	return s.save()
+	// 存副本：避免调用方随后修改自己传入的 slice 直接改到存储内容
+	s.pool = PoolConfig{Addresses: append([]string(nil), pool.Addresses...)}
+	if s.pool.Addresses == nil {
+		s.pool.Addresses = []string{}
+	}
+	s.mu.Unlock()
+	return s.persist()
 }
 
 // HasLimit 检查指定频道是否有启用的限制规则。
@@ -348,7 +355,6 @@ func (s *Store) EndSession(address string, start, end time.Time) {
 		return
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	st := s.sessions[address]
 	if st == nil {
 		st = &SessionState{}
@@ -356,11 +362,15 @@ func (s *Store) EndSession(address string, start, end time.Time) {
 	}
 	st.LastEnd = end
 	st.ContSec += int64(end.Sub(start).Seconds())
-	if s.enabledLimitLocked(address) == nil {
+	needSave := s.enabledLimitLocked(address) != nil
+	if !needSave {
 		delete(s.sessions, address)
+	}
+	s.mu.Unlock()
+	if !needSave {
 		return
 	}
-	if err := s.save(); err != nil {
+	if err := s.persist(); err != nil {
 		log.Printf("[limits] 连续观看状态落盘失败: %v", err)
 	}
 }
@@ -454,15 +464,43 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-// save 原子持久化到磁盘，调用方需持有 s.mu。
-func (s *Store) save() error {
-	return storeutil.WriteJSON(s.path, struct {
-		Limits   []Limit                  `json:"limits"`
-		Pool     PoolConfig               `json:"pool"`
-		Sessions map[string]*SessionState `json:"sessions"`
-	}{
-		Limits:   s.limits,
-		Pool:     s.pool,
-		Sessions: s.sessions,
-	}, 0o644)
+// fileWrite 落盘格式（新格式）。
+type fileWrite struct {
+	Limits   []Limit                  `json:"limits"`
+	Pool     PoolConfig               `json:"pool"`
+	Sessions map[string]*SessionState `json:"sessions"`
+}
+
+// snapshotLocked 构造落盘快照（调用方需持 s.mu）：pool 与 sessions 均深拷贝，
+// 写盘期间不再触碰内存状态。
+func (s *Store) snapshotLocked() fileWrite {
+	return fileWrite{
+		Limits:   append([]Limit(nil), s.limits...),
+		Pool:     PoolConfig{Addresses: append([]string(nil), s.pool.Addresses...)},
+		Sessions: deepCopySessions(s.sessions),
+	}
+}
+
+func deepCopySessions(src map[string]*SessionState) map[string]*SessionState {
+	out := make(map[string]*SessionState, len(src))
+	for k, v := range src {
+		if v == nil {
+			continue
+		}
+		cp := *v
+		out[k] = &cp
+	}
+	return out
+}
+
+// persist 串行落盘：saveMu 内先取快照再写文件，保证快照顺序与落盘顺序一致。
+// 写盘不持 s.mu——各流收尾的 EndSession 与各流的 CheckLimit 共用 s.mu，
+// 慢盘上持锁写文件会把这些热路径一起拖住。调用方不得持 s.mu。
+func (s *Store) persist() error {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	s.mu.Lock()
+	fw := s.snapshotLocked()
+	s.mu.Unlock()
+	return storeutil.WriteJSON(s.path, fw, 0o644)
 }

@@ -4,6 +4,8 @@ package channels
 import (
 	"bufio"
 	"fmt"
+	"log"
+	"net/netip"
 	"regexp"
 	"sort"
 	"strings"
@@ -52,6 +54,11 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	for i := range list {
+		// 手工编辑的频道文件可能带非法地址：保留条目不丢数据，但显著告警，
+		// 否则要到取流时才暴露，且日志只有地址没有频道名。
+		if _, err := netip.ParseAddrPort(list[i].Address); err != nil {
+			log.Printf("[channels] 频道 %s(%s) 地址非法: %q", list[i].Name, list[i].ID, list[i].Address)
+		}
 		s.channels[list[i].Address] = &list[i]
 	}
 	s.reindex()

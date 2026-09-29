@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"net/netip"
 	"sync"
 	"time"
@@ -29,9 +30,10 @@ type Rule struct {
 
 // Store 规则集合，带 JSON 文件持久化。
 type Store struct {
-	mu    sync.Mutex
-	path  string
-	rules []Rule
+	mu     sync.Mutex
+	saveMu sync.Mutex // 串行化落盘：快照与写盘同序，且写文件不持 mu
+	path   string
+	rules  []Rule
 }
 
 // Open 加载（或初始化）规则文件。文件损坏时备份后以空规则起步，不 fatal。
@@ -43,16 +45,40 @@ func Open(path string) (*Store, error) {
 	if s.rules == nil {
 		s.rules = []Rule{}
 	}
+	// 手工编辑的文件可能带非法地址：保留条目不丢数据，但显著告警，
+	// 否则要到取流时才暴露，且日志只有地址没有规则名。
+	for _, r := range s.rules {
+		if _, err := normAddr(r.From); err != nil {
+			log.Printf("[rules] 规则 %s(%s) 的请求地址非法: %q", r.Name, r.ID, r.From)
+		}
+		if _, err := normAddr(r.To); err != nil {
+			log.Printf("[rules] 规则 %s(%s) 的替换地址非法: %q", r.Name, r.ID, r.To)
+		}
+	}
 	return s, nil
+}
+
+// cloneRule 拷贝规则（Days 是 slice，须复制底层数组，避免调用方修改与 Resolve 读取竞争）。
+func cloneRule(r Rule) Rule {
+	if r.Days != nil {
+		r.Days = append([]int(nil), r.Days...)
+	}
+	return r
+}
+
+func cloneRules(rs []Rule) []Rule {
+	out := make([]Rule, len(rs))
+	for i, r := range rs {
+		out[i] = cloneRule(r)
+	}
+	return out
 }
 
 // List 返回规则副本。
 func (s *Store) List() []Rule {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	out := make([]Rule, len(s.rules))
-	copy(out, s.rules)
-	return out
+	return cloneRules(s.rules)
 }
 
 // Add 校验并新增一条规则。
@@ -62,9 +88,10 @@ func (s *Store) Add(r Rule) (Rule, error) {
 	}
 	r.ID = newID()
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	r = cloneRule(r)
 	s.rules = append(s.rules, r)
-	return r, s.save()
+	s.mu.Unlock()
+	return cloneRule(r), s.persist()
 }
 
 // Update 按 ID 更新规则。
@@ -73,27 +100,30 @@ func (s *Store) Update(id string, r Rule) (Rule, error) {
 		return Rule{}, err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for i := range s.rules {
 		if s.rules[i].ID == id {
 			r.ID = id
+			r = cloneRule(r)
 			s.rules[i] = r
-			return r, s.save()
+			s.mu.Unlock()
+			return cloneRule(r), s.persist()
 		}
 	}
+	s.mu.Unlock()
 	return Rule{}, fmt.Errorf("规则 %s 不存在", id)
 }
 
 // Delete 按 ID 删除规则。
 func (s *Store) Delete(id string) error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for i := range s.rules {
 		if s.rules[i].ID == id {
 			s.rules = append(s.rules[:i], s.rules[i+1:]...)
-			return s.save()
+			s.mu.Unlock()
+			return s.persist()
 		}
 	}
+	s.mu.Unlock()
 	return fmt.Errorf("规则 %s 不存在", id)
 }
 
@@ -215,7 +245,13 @@ func newID() string {
 	return hex.EncodeToString(b)
 }
 
-// save 原子持久化到磁盘，调用方需持有 s.mu。
-func (s *Store) save() error {
-	return storeutil.WriteJSON(s.path, s.rules, 0o644)
+// persist 串行落盘：saveMu 内取快照再写文件，写盘不持 mu
+// （Resolve 是每请求热路径，不能被慢盘拖住）。调用方不得持 s.mu。
+func (s *Store) persist() error {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	s.mu.Lock()
+	snap := cloneRules(s.rules)
+	s.mu.Unlock()
+	return storeutil.WriteJSON(s.path, snap, 0o644)
 }

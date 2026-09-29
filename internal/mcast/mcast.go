@@ -11,9 +11,13 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"time"
 
 	"golang.org/x/net/ipv4"
 )
+
+// readErrBackoff 读包出错的退避间隔。
+const readErrBackoff = 5 * time.Millisecond
 
 // Packet 一条组播数据（Data 为该包内容的拷贝，长度即包长）。
 type Packet struct {
@@ -142,6 +146,9 @@ func (r *Reader) readLoop() {
 				return
 			default:
 			}
+			// 非关闭错误（网口 down 期间的 ENETDOWN 一类）会立即返回，
+			// 无退避地 continue 会让该 reader 100% 空转烧 CPU。
+			time.Sleep(readErrBackoff)
 			continue
 		}
 		// 复制一份，避免 buffer 覆盖
@@ -169,9 +176,13 @@ func (r *Reader) broadcast(data []byte) {
 	}
 }
 
-// Key 返回标识该 reader 的唯一字符串。
-func Key(group string, port int) string {
-	return netip.MustParseAddrPort(
-		fmt.Sprintf("%s:%d", group, port),
-	).String()
+// Key 返回标识该 reader 的唯一规范化字符串。
+// 地址非法时返回错误而非 panic：配置文件允许手工编辑，此前用 MustParseAddrPort
+// 会让畸形条目在调用方（含无 recover 的录制 tick goroutine）直接打崩整个进程。
+func Key(group string, port int) (string, error) {
+	ap, err := netip.ParseAddrPort(fmt.Sprintf("%s:%d", group, port))
+	if err != nil {
+		return "", fmt.Errorf("无效的组播地址 %s:%d: %w", group, port, err)
+	}
+	return ap.String(), nil
 }

@@ -44,6 +44,7 @@ type PeriodResult struct {
 // Store 观看时长存储：内存聚合 + 定时落盘。
 type Store struct {
 	mu        sync.Mutex
+	saveMu    sync.Mutex // 串行化落盘，使写文件不持 mu
 	path      string
 	aggr      map[string]map[string]int64 // address -> "2006-01-02" -> 秒
 	closeOnce sync.Once
@@ -168,20 +169,40 @@ func (s *Store) AddRange(address string, start, end time.Time) {
 }
 
 // Flush 立即落盘（并顺带裁剪过期数据）。
+// 持 mu 只做裁剪与快照，写盘在 saveMu 内完成，避免慢盘阻塞观看流收尾的 AddRange。
 func (s *Store) Flush() error {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.pruneLocked(time.Now())
-	return storeutil.WriteJSON(s.path, s.aggr, 0o644)
+	snap := s.snapshotLocked()
+	s.mu.Unlock()
+
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	return storeutil.WriteJSON(s.path, snap, 0o644)
+}
+
+// snapshotLocked 深拷贝聚合表（调用方须持 mu）。
+func (s *Store) snapshotLocked() map[string]map[string]int64 {
+	snap := make(map[string]map[string]int64, len(s.aggr))
+	for addr, byDate := range s.aggr {
+		d := make(map[string]int64, len(byDate))
+		for k, v := range byDate {
+			d[k] = v
+		}
+		snap[addr] = d
+	}
+	return snap
 }
 
 // ClearAll 清空全部统计并落盘。
 func (s *Store) ClearAll() error {
 	s.mu.Lock()
 	s.aggr = make(map[string]map[string]int64)
-	err := storeutil.WriteJSON(s.path, s.aggr, 0o644)
 	s.mu.Unlock()
-	return err
+
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	return storeutil.WriteJSON(s.path, map[string]map[string]int64{}, 0o644)
 }
 
 // HistoricalSum 返回某频道在指定日期的累计秒数（不含正在观看的当前流）。
@@ -211,10 +232,6 @@ func (s *Store) HistoricalSumWeek(address string, year int, week int) int64 {
 // Query 查询指定维度（day/week/month）的统计结果，nameFn 用于地址->频道名映射。
 // top>0 时只返回前 top 名（total 仍为全量合计）。
 func (s *Store) Query(period string, dateStr string, top int, nameFn func(string) string) PeriodResult {
-	s.mu.Lock()
-	aggr := s.aggr
-	s.mu.Unlock()
-
 	now := time.Now()
 	var weekYear, weekNo int
 	var monthYear int
@@ -233,8 +250,11 @@ func (s *Store) Query(period string, dateStr string, top int, nameFn func(string
 		}
 	}
 
-	perAddr := make(map[string]int64)
-	for addr, byDate := range aggr {
+	// 遍历聚合表须全程持 mu：Add/AddRange 会并发插入内外层 key，pruneLocked 会并发删除，
+	// 无锁遍历会触发 fatal "concurrent map iteration and map write" 直接崩进程。
+	s.mu.Lock()
+	perAddr := make(map[string]int64, len(s.aggr))
+	for addr, byDate := range s.aggr {
 		var sec int64
 		switch period {
 		case "week":
@@ -260,6 +280,7 @@ func (s *Store) Query(period string, dateStr string, top int, nameFn func(string
 			perAddr[addr] = sec
 		}
 	}
+	s.mu.Unlock()
 
 	var total int64
 	items := make([]RankItem, 0, len(perAddr))

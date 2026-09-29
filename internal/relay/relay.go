@@ -73,6 +73,7 @@ type Manager struct {
 
 	mu          sync.Mutex
 	readers     map[string]*readerEntry
+	keyMu       map[string]*sync.Mutex // 每组播地址一把创建锁，使建 socket 不持全局 mu
 	streams     map[string]*StreamInfo
 	counter     int64
 	idleTimeout time.Duration // 空闲断开超时
@@ -84,6 +85,7 @@ type readerEntry struct {
 	reader *mcast.Reader
 	ch     chan mcast.Packet
 	refCnt int
+	key    string // 创建时的规范化组播地址，release 直接用它，不再二次解析
 }
 
 type inputMode uint8
@@ -136,6 +138,7 @@ func New(ifaceName string, ruleStore *rules.Store) *Manager {
 		ifaceName:    ifaceName,
 		rules:        ruleStore,
 		readers:      make(map[string]*readerEntry),
+		keyMu:        make(map[string]*sync.Mutex),
 		streams:      make(map[string]*StreamInfo),
 		limitBlocked: make(map[string]time.Time),
 		idleTimeout:  5 * time.Minute, // 默认 5 分钟空闲断开
@@ -233,7 +236,7 @@ func (m *Manager) AcquireSource(addr string, rtp bool) (RecSource, error) {
 		ErrCh:   subErr,
 		Release: func() {
 			unsub()
-			m.releaseReader(group, port, entry)
+			m.releaseReader(entry)
 			// 已无任何消费者（观看流或录制订阅）时启动空闲断线计时
 			if m.pppoe != nil {
 				if idle, to := m.idleIfConsumersGone(); idle {
@@ -368,7 +371,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "组播加入失败: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	defer func() { m.releaseReader(realGroup, realPort, entry) }()
+	defer func() { m.releaseReader(entry) }()
 
 	// 注册订阅。队列溢出时主动结束连接，不能继续输出已静默丢包的 TS。
 	ch := make(chan mcast.Packet, 512)
@@ -475,7 +478,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if newEntry != nil {
 			log.Printf("[relay] 取消待切换到 %s", pendingRealAddr)
 			newUnsub()
-			m.releaseReader(pendingGroup, pendingPort, newEntry)
+			m.releaseReader(newEntry)
 			newEntry = nil
 			newCh = nil
 			newUnsub = nil
@@ -584,7 +587,7 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				}
 
 				unsub()
-				m.releaseReader(realGroup, realPort, entry)
+				m.releaseReader(entry)
 
 				ch = newCh
 				subErr = newSubErr
@@ -779,15 +782,34 @@ func (m *Manager) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // getOrCreateReader 获取或创建组播 reader，引用计数 +1。
+// 建 socket（查网口 + ListenUDP + JoinGroup）在每地址一把创建锁内完成，
+// 不持全局 mu——否则新源建连期间所有活跃流的字节计数、流列表查询与回收都要排队。
 func (m *Manager) getOrCreateReader(group string, port int) (*readerEntry, error) {
-	key := mcast.Key(group, port)
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	key, err := mcast.Key(group, port)
+	if err != nil {
+		return nil, err
+	}
 
+	// 快速路径：reader 已就绪
+	m.mu.Lock()
 	if e, ok := m.readers[key]; ok {
 		e.refCnt++
+		m.mu.Unlock()
 		return e, nil
 	}
+	m.mu.Unlock()
+
+	mu := m.keyLock(key)
+	mu.Lock()
+	defer mu.Unlock()
+
+	m.mu.Lock()
+	if e, ok := m.readers[key]; ok { // 双检：等锁期间可能已被他人创建
+		e.refCnt++
+		m.mu.Unlock()
+		return e, nil
+	}
+	m.mu.Unlock()
 
 	rd, err := mcast.NewReader(group, port, m.ifaceName)
 	if err != nil {
@@ -796,20 +818,33 @@ func (m *Manager) getOrCreateReader(group string, port int) (*readerEntry, error
 	if err := rd.Start(); err != nil {
 		return nil, err
 	}
-	e := &readerEntry{reader: rd, refCnt: 1}
+	e := &readerEntry{reader: rd, refCnt: 1, key: key}
+	m.mu.Lock()
 	m.readers[key] = e
+	m.mu.Unlock()
 	return e, nil
 }
 
-// releaseReader 引用计数 -1，归零时停止并移除。
-func (m *Manager) releaseReader(group string, port int, entry *readerEntry) {
+// keyLock 返回该组播地址的创建锁（调用方不得持 mu）。
+func (m *Manager) keyLock(key string) *sync.Mutex {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	key := mcast.Key(group, port)
+	l, ok := m.keyMu[key]
+	if !ok {
+		l = &sync.Mutex{}
+		m.keyMu[key] = l
+	}
+	return l
+}
+
+// releaseReader 引用计数 -1，归零时停止并移除。
+func (m *Manager) releaseReader(entry *readerEntry) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	entry.refCnt--
 	if entry.refCnt <= 0 {
 		entry.reader.Stop()
-		delete(m.readers, key)
+		delete(m.readers, entry.key)
 	}
 }
 

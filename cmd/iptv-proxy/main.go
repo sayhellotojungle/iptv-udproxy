@@ -108,7 +108,7 @@ func main() {
 		Unit:  appSettings.PPPoEUnit,
 	}
 	pppoeMgr := pppoe.New(pppoeCfg, cfg.DataDir)
-	defer pppoeMgr.Stop() // 确保任何退出路径（含 HTTP 致命错误）都拆除 pppd/系统状态
+	defer pppoeMgr.Shutdown() // 确保任何退出路径（含 HTTP 致命错误）都拆除 pppd/系统状态，并终止自动重连
 	pppoeMgr.SetEnabled(appSettings.PPPoEEnable)
 	pppoeMgr.SetOnDemand(appSettings.OnDemand)
 
@@ -217,6 +217,6 @@ func main() {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(shutdownCtx)
-	// pppoe.Stop / statsStore.Close / guard.Stop 由 defer 完成
+	// pppoe.Shutdown / statsStore.Close / guard.Stop 由 defer 完成
 	log.Println("[main] 已退出")
 }
